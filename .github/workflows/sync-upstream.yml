@@ -45,14 +45,40 @@ jobs:
             echo "status=conflict" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Install Claude Code
+        if: steps.sync.outputs.status == 'conflict'
+        run: npm install -g @anthropic-ai/claude-code
+
       - name: Resolve conflicts with Claude Code
         if: steps.sync.outputs.status == 'conflict'
-        uses: anthropics/claude-code-action@v1
-        with:
-          prompt: |
-            Upstream main from thedotmack/claude-mem has conflicts with our fork.
-            Run: git remote add upstream https://github.com/thedotmack/claude-mem.git && git fetch upstream main && git merge upstream/main
-            Then resolve all merge conflicts. Our local changes (HEAD) take priority over upstream when intent conflicts. For purely additive upstream changes, accept them.
-            After resolving, commit the merge and push to origin main.
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          claude_args: "--model sonnet"
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Start merge (will have conflicts)
+          git merge upstream/main --no-edit || true
+
+          # Use Claude Code to resolve conflicts
+          claude -p "
+          There are git merge conflicts in this repository. Resolve ALL conflicts:
+          - Our local changes (HEAD) take priority when there is an intent conflict.
+          - For purely additive upstream changes, accept them.
+          - For import conflicts, keep BOTH sides.
+          - After resolving each file, run 'git add <file>'.
+          - Finally run 'git status' to verify no conflicts remain.
+          Do NOT create a commit - just resolve and stage.
+          " --model sonnet --allowedTools "Bash,Read,Write,Edit,Glob,Grep"
+
+          # Verify no conflict markers remain
+          if grep -rn "<<<<<<" --include="*.ts" --include="*.js" .; then
+            echo "::error::Conflict markers still present"
+            exit 1
+          fi
+
+          # Commit and push
+          git commit --no-edit
+          git push origin main
+          echo "Conflicts resolved and pushed"
