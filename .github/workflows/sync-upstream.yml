@@ -54,5 +54,4 @@ jobs:
             Then resolve all merge conflicts. Our local changes (HEAD) take priority over upstream when intent conflicts. For purely additive upstream changes, accept them.
             After resolving, commit the merge and push to origin main.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          model: sonnet
-          timeout_minutes: 10
+          claude_args: "--model sonnet"
