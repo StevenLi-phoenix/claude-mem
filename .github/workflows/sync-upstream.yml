@@ -2,11 +2,12 @@ name: Sync upstream
 
 on:
   schedule:
-    - cron: '0 8 * * *'  # UTC 8:00 = 北京时间 16:00，每天一次
+    - cron: '0 8 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   sync:
@@ -19,6 +20,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync upstream main
+        id: sync
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -28,18 +30,29 @@ jobs:
 
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "Already up to date"
+            echo "status=up-to-date" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if git merge upstream/main --no-edit; then
             git push origin main
             echo "Merged upstream/main successfully"
+            echo "status=merged" >> "$GITHUB_OUTPUT"
           else
             git merge --abort
-            echo "::warning::Merge conflict detected, creating PR instead"
-            BRANCH="auto-sync/upstream-$(date +%Y%m%d)"
-            git checkout -b "$BRANCH"
-            git merge upstream/main --no-edit || true
-            echo "Conflict needs manual resolution"
-            exit 1
+            echo "::warning::Merge conflict detected, will use Claude Code to resolve"
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Resolve conflicts with Claude Code
+        if: steps.sync.outputs.status == 'conflict'
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: |
+            Upstream main from thedotmack/claude-mem has conflicts with our fork.
+            Run: git remote add upstream https://github.com/thedotmack/claude-mem.git && git fetch upstream main && git merge upstream/main
+            Then resolve all merge conflicts. Our local changes (HEAD) take priority over upstream when intent conflicts. For purely additive upstream changes, accept them.
+            After resolving, commit the merge and push to origin main.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          model: sonnet
+          timeout_minutes: 10
