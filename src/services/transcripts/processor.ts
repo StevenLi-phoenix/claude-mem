@@ -1,29 +1,28 @@
+import path from 'path';
 import { sessionInitHandler } from '../../cli/handlers/session-init.js';
-import { observationHandler } from '../../cli/handlers/observation.js';
 import { fileEditHandler } from '../../cli/handlers/file-edit.js';
-import { sessionCompleteHandler } from '../../cli/handlers/session-complete.js';
 import { ensureWorkerRunning, workerHttpRequest } from '../../shared/worker-utils.js';
+import { DATA_DIR } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
-import { getProjectContext, getProjectName } from '../../utils/project-name.js';
+import { getProjectContext } from '../../utils/project-name.js';
 import { writeAgentsMd } from '../../utils/agents-md-utils.js';
 import { resolveFieldSpec, resolveFields, matchesRule } from './field-utils.js';
 import { expandHomePath } from './config.js';
 import type { TranscriptSchema, WatchTarget, SchemaEvent } from './types.js';
+import { normalizePlatformSource } from '../../shared/platform-source.js';
+import { ingestObservation } from '../worker/http/shared.js';
 
 interface SessionState {
   sessionId: string;
+  platformSource: string;
   cwd?: string;
   project?: string;
   lastUserMessage?: string;
   lastAssistantMessage?: string;
-  pendingTools: Map<string, { name?: string; input?: unknown }>;
-}
-
-interface PendingTool {
-  id?: string;
-  name?: string;
-  input?: unknown;
-  response?: unknown;
+  // In-memory pairing for transcript schemas (e.g. Codex) where tool_use
+  // carries toolName + toolInput and tool_result only carries tool_use_id +
+  // output. Keyed by toolId; consumed and deleted on the matching tool_result.
+  pendingTools?: Map<string, { toolName: string; toolInput: unknown }>;
 }
 
 export class TranscriptEventProcessor {
@@ -51,7 +50,7 @@ export class TranscriptEventProcessor {
     if (!session) {
       session = {
         sessionId,
-        pendingTools: new Map()
+        platformSource: normalizePlatformSource(watch.name),
       };
       this.sessions.set(key, session);
     }
@@ -101,7 +100,7 @@ export class TranscriptEventProcessor {
     const resolved = resolveFieldSpec(fieldSpec, entry, ctx);
     if (typeof resolved === 'string' && resolved.trim()) return resolved;
     if (watch.project) return watch.project;
-    if (session.cwd) return getProjectName(session.cwd);
+    if (session.cwd) return getProjectContext(session.cwd).primary;
     return session.project;
   }
 
@@ -124,7 +123,7 @@ export class TranscriptEventProcessor {
     const project = this.resolveProject(entry, watch, schema, event, session);
     if (project) session.project = project;
 
-    const fields = resolveFields(event.fields, entry, { watch, schema, session });
+    const fields = resolveFields(event.fields, entry, { watch, schema, session: session as unknown as Record<string, unknown> });
 
     switch (event.action) {
       case 'session_context':
@@ -181,7 +180,7 @@ export class TranscriptEventProcessor {
       sessionId: session.sessionId,
       cwd,
       prompt,
-      platform: 'transcript'
+      platform: session.platformSource
     });
   }
 
@@ -190,12 +189,6 @@ export class TranscriptEventProcessor {
     const toolName = typeof fields.toolName === 'string' ? fields.toolName : undefined;
     const toolInput = this.maybeParseJson(fields.toolInput);
     const toolResponse = this.maybeParseJson(fields.toolResponse);
-
-    const pending: PendingTool = { id: toolId, name: toolName, input: toolInput, response: toolResponse };
-
-    if (toolId) {
-      session.pendingTools.set(toolId, { name: pending.name, input: pending.input });
-    }
 
     if (toolName === 'apply_patch' && typeof toolInput === 'string') {
       const files = this.parseApplyPatchFiles(toolInput);
@@ -207,35 +200,61 @@ export class TranscriptEventProcessor {
       }
     }
 
-    if (toolResponse !== undefined && toolName) {
+    // Two schema shapes to support:
+    //   1. Self-contained events (e.g. Claude JSONL): tool_use and tool_result
+    //      both carry toolName; tool_use may already include toolResponse.
+    //   2. Split events (e.g. Codex): tool_use carries toolName + toolInput,
+    //      tool_result carries only toolUseId + output. Neither side alone
+    //      has both toolName and toolResponse.
+    //
+    // For (1) we emit eagerly when toolResponse is present. For (2) we stash
+    // toolName/toolInput on the session keyed by toolId so handleToolResult
+    // can join them at tool_result time. The DB's
+    // UNIQUE(content_session_id, tool_use_id) index collapses any duplicate
+    // emissions that arise when both events carry a complete record.
+    if (toolName && toolResponse !== undefined) {
       await this.sendObservation(session, {
         toolName,
         toolInput,
-        toolResponse
+        toolResponse,
+        toolUseId: toolId,
       });
+    } else if (toolName && toolId) {
+      if (!session.pendingTools) session.pendingTools = new Map();
+      session.pendingTools.set(toolId, { toolName, toolInput });
     }
   }
 
   private async handleToolResult(session: SessionState, fields: Record<string, unknown>): Promise<void> {
     const toolId = typeof fields.toolId === 'string' ? fields.toolId : undefined;
-    const toolName = typeof fields.toolName === 'string' ? fields.toolName : undefined;
+    let toolName = typeof fields.toolName === 'string' ? fields.toolName : undefined;
     const toolResponse = this.maybeParseJson(fields.toolResponse);
+    let toolInput = this.maybeParseJson(fields.toolInput);
 
-    let toolInput: unknown = this.maybeParseJson(fields.toolInput);
-    let name = toolName;
-
-    if (toolId && session.pendingTools.has(toolId)) {
-      const pending = session.pendingTools.get(toolId)!;
-      toolInput = pending.input ?? toolInput;
-      name = name ?? pending.name;
-      session.pendingTools.delete(toolId);
+    // Consume any pending-tool entry for this toolId regardless of whether the
+    // tool_result already carries toolName: in the split-schema path the
+    // result always resolves the pending entry, so leaving it behind would
+    // grow the map until session end.
+    if (toolId && session.pendingTools) {
+      const pending = session.pendingTools.get(toolId);
+      if (pending) {
+        if (!toolName) toolName = pending.toolName;
+        if (toolInput === undefined) toolInput = pending.toolInput;
+        session.pendingTools.delete(toolId);
+      }
     }
 
-    if (name) {
+    if (toolName) {
       await this.sendObservation(session, {
-        toolName: name,
+        toolName,
         toolInput,
-        toolResponse
+        toolResponse,
+        toolUseId: toolId,
+      });
+    } else {
+      logger.debug('TRANSCRIPT', 'Dropping tool_result with no resolvable toolName', {
+        sessionId: session.sessionId,
+        toolId,
       });
     }
   }
@@ -244,14 +263,23 @@ export class TranscriptEventProcessor {
     const toolName = typeof fields.toolName === 'string' ? fields.toolName : undefined;
     if (!toolName) return;
 
-    await observationHandler.execute({
-      sessionId: session.sessionId,
+    // PATHFINDER plan 03 phase 7: replace HTTP loopback (worker → its own
+    // /api/sessions/observations endpoint) with a direct in-process call to
+    // ingestObservation. Same implementation backs the cross-process HTTP
+    // route handler (one helper, N callers).
+    const result = ingestObservation({
+      contentSessionId: session.sessionId,
       cwd: session.cwd ?? process.cwd(),
       toolName,
       toolInput: this.maybeParseJson(fields.toolInput),
       toolResponse: this.maybeParseJson(fields.toolResponse),
-      platform: 'transcript'
+      platformSource: session.platformSource,
+      toolUseId: typeof fields.toolUseId === 'string' ? fields.toolUseId : undefined,
     });
+
+    if (!result.ok) {
+      throw new Error(`ingestObservation failed: ${result.reason}`);
+    }
   }
 
   private async sendFileEdit(session: SessionState, fields: Record<string, unknown>): Promise<void> {
@@ -263,7 +291,7 @@ export class TranscriptEventProcessor {
       cwd: session.cwd ?? process.cwd(),
       filePath,
       edits: Array.isArray(fields.edits) ? fields.edits : undefined,
-      platform: 'transcript'
+      platform: session.platformSource
     });
   }
 
@@ -272,9 +300,17 @@ export class TranscriptEventProcessor {
     const trimmed = value.trim();
     if (!trimmed) return value;
     if (!(trimmed.startsWith('{') || trimmed.startsWith('['))) return value;
+    // Pass through the raw string on parse failure rather than throwing.
+    // Throwing from this helper propagates to `handleLine`'s outer catch,
+    // which then silently drops the entire transcript line — including any
+    // valid sibling fields. A single malformed JSON-shaped field should
+    // degrade to opaque-string handling, not lose the whole observation.
     try {
       return JSON.parse(trimmed);
-    } catch {
+    } catch (error) {
+      logger.debug('TRANSCRIPT', 'Field looked like JSON but did not parse; using raw string', {
+        preview: trimmed.slice(0, 120),
+      }, error instanceof Error ? error : undefined);
       return value;
     }
   }
@@ -302,13 +338,8 @@ export class TranscriptEventProcessor {
 
   private async handleSessionEnd(session: SessionState, watch: WatchTarget): Promise<void> {
     await this.queueSummary(session);
-    await sessionCompleteHandler.execute({
-      sessionId: session.sessionId,
-      cwd: session.cwd ?? process.cwd(),
-      platform: 'transcript'
-    });
     await this.updateContext(session, watch);
-    session.pendingTools.clear();
+    session.pendingTools?.clear();
     const key = this.getSessionKey(watch, session.sessionId);
     this.sessions.delete(key);
   }
@@ -318,17 +349,19 @@ export class TranscriptEventProcessor {
     if (!workerReady) return;
 
     const lastAssistantMessage = session.lastAssistantMessage ?? '';
+    const requestBody = JSON.stringify({
+      contentSessionId: session.sessionId,
+      last_assistant_message: lastAssistantMessage,
+      platformSource: session.platformSource
+    });
 
     try {
       await workerHttpRequest('/api/sessions/summarize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contentSessionId: session.sessionId,
-          last_assistant_message: lastAssistantMessage
-        })
+        body: requestBody
       });
-    } catch (error) {
+    } catch (error: unknown) {
       logger.warn('TRANSCRIPT', 'Summary request failed', {
         error: error instanceof Error ? error.message : String(error)
       });
@@ -348,22 +381,38 @@ export class TranscriptEventProcessor {
     const context = getProjectContext(cwd);
     const projectsParam = context.allProjects.join(',');
 
+    const contextUrl = `/api/context/inject?projects=${encodeURIComponent(projectsParam)}`;
+    const agentsPath = expandHomePath(watch.context.path ?? `${cwd}/AGENTS.md`);
+
+    // Validate resolved path stays within allowed directories (#1934)
+    const resolvedAgentsPath = path.resolve(agentsPath);
+    const allowedRoots = [path.resolve(cwd), path.resolve(DATA_DIR)];
+    const isPathSafe = allowedRoots.some(root => resolvedAgentsPath.startsWith(root + path.sep) || resolvedAgentsPath === root);
+    if (!isPathSafe) {
+      logger.warn('SECURITY', 'Rejected path traversal attempt in watch.context.path', {
+        original: watch.context.path,
+        resolved: resolvedAgentsPath,
+        allowedRoots
+      });
+      return;
+    }
+
+    let response: Awaited<ReturnType<typeof workerHttpRequest>>;
     try {
-      const response = await workerHttpRequest(
-        `/api/context/inject?projects=${encodeURIComponent(projectsParam)}`
-      );
-      if (!response.ok) return;
-
-      const content = (await response.text()).trim();
-      if (!content) return;
-
-      const agentsPath = expandHomePath(watch.context.path ?? `${cwd}/AGENTS.md`);
-      writeAgentsMd(agentsPath, content);
-      logger.debug('TRANSCRIPT', 'Updated AGENTS.md context', { agentsPath, watch: watch.name });
-    } catch (error) {
-      logger.warn('TRANSCRIPT', 'Failed to update AGENTS.md context', {
+      response = await workerHttpRequest(contextUrl);
+    } catch (error: unknown) {
+      logger.warn('TRANSCRIPT', 'Failed to fetch AGENTS.md context', {
         error: error instanceof Error ? error.message : String(error)
       });
+      return;
     }
+
+    if (!response.ok) return;
+
+    const content = (await response.text()).trim();
+    if (!content) return;
+
+    writeAgentsMd(agentsPath, content);
+    logger.debug('TRANSCRIPT', 'Updated AGENTS.md context', { agentsPath, watch: watch.name });
   }
 }

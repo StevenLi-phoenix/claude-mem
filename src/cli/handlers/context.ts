@@ -6,29 +6,19 @@
  */
 
 import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js';
-import { ensureWorkerRunning, getWorkerPort, workerHttpRequest } from '../../shared/worker-utils.js';
+import {
+  executeWithWorkerFallback,
+  isWorkerFallback,
+  getWorkerPort,
+} from '../../shared/worker-utils.js';
 import { getProjectContext } from '../../utils/project-name.js';
 import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { logger } from '../../utils/logger.js';
-import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH } from '../../shared/paths.js';
 import { isProjectExcluded, isProjectLocallyDisabled } from '../../utils/project-filter.js';
+import { loadFromFileOnce } from '../../shared/hook-settings.js';
 
 export const contextHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
-    // Ensure worker is running before any other logic
-    const workerReady = await ensureWorkerRunning();
-    if (!workerReady) {
-      // Worker not available - return empty context gracefully
-      return {
-        hookSpecificOutput: {
-          hookEventName: 'SessionStart',
-          additionalContext: ''
-        },
-        exitCode: HOOK_EXIT_CODES.SUCCESS
-      };
-    }
-
     const cwd = input.cwd ?? process.cwd();
 
     // Check local .claude-mem-disable file first (no settings required)
@@ -43,8 +33,8 @@ export const contextHandler: EventHandler = {
     const context = getProjectContext(cwd);
     const port = getWorkerPort();
 
-    // Check if terminal output should be shown (load settings early)
-    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    // Plan 05 Phase 4: settings via process-scope cache.
+    const settings = loadFromFileOnce();
     const showTerminalOutput = settings.CLAUDE_MEM_CONTEXT_SHOW_TERMINAL_OUTPUT === 'true';
 
     // Check if project is excluded from tracking
@@ -61,56 +51,53 @@ export const contextHandler: EventHandler = {
     const apiPath = `/api/context/inject?projects=${encodeURIComponent(projectsParam)}`;
     const colorApiPath = input.platform === 'claude-code' ? `${apiPath}&colors=true` : apiPath;
 
-    // Note: Removed AbortSignal.timeout due to Windows Bun cleanup issue (libuv assertion)
-    // Worker service has its own timeouts, so client-side timeout is redundant
-    try {
-      // Fetch markdown (for Claude context) and optionally colored (for user display)
-      const [response, colorResponse] = await Promise.all([
-        workerHttpRequest(apiPath),
-        showTerminalOutput ? workerHttpRequest(colorApiPath).catch(() => null) : Promise.resolve(null)
-      ]);
+    const emptyResult: HookResult = {
+      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: '' },
+      exitCode: HOOK_EXIT_CODES.SUCCESS,
+    };
 
-      if (!response.ok) {
-        // Log but don't throw — context fetch failure should not block session start
-        logger.warn('HOOK', 'Context generation failed, returning empty', { status: response.status });
-        return {
-          hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: '' },
-          exitCode: HOOK_EXIT_CODES.SUCCESS
-        };
-      }
-
-      const [contextResult, colorResult] = await Promise.all([
-        response.text(),
-        colorResponse?.ok ? colorResponse.text() : Promise.resolve('')
-      ]);
-
-      const additionalContext = contextResult.trim();
-      const coloredTimeline = colorResult.trim();
-      const platform = input.platform;
-
-      // Use colored timeline for display if available, otherwise fall back to 
-      // plain markdown context (especially useful for platforms like Gemini 
-      // where we want to ensure visibility even if colors aren't fetched).
-      const displayContent = coloredTimeline || (platform === 'gemini-cli' || platform === 'gemini' ? additionalContext : '');
-
-      const systemMessage = showTerminalOutput && displayContent
-        ? `${displayContent}\n\nView Observations Live @ http://localhost:${port}`
-        : undefined;
-
-      return {
-        hookSpecificOutput: {
-          hookEventName: 'SessionStart',
-          additionalContext
-        },
-        systemMessage
-      };
-    } catch (error) {
-      // Worker unreachable — return empty context gracefully
-      logger.warn('HOOK', 'Context fetch error, returning empty', { error: error instanceof Error ? error.message : String(error) });
-      return {
-        hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: '' },
-        exitCode: HOOK_EXIT_CODES.SUCCESS
-      };
+    // Plan 05 Phase 2: single helper for ensure-worker-alive → request → fallback.
+    const contextResult = await executeWithWorkerFallback<string>(apiPath, 'GET');
+    if (isWorkerFallback(contextResult)) {
+      return emptyResult;
     }
+
+    let additionalContext: string;
+    if (typeof contextResult === 'string') {
+      additionalContext = contextResult.trim();
+    } else if (contextResult === undefined) {
+      additionalContext = '';
+    } else {
+      // Unexpected non-string body — log and fall back to empty.
+      logger.warn('HOOK', 'Context response was not a string', { type: typeof contextResult });
+      return emptyResult;
+    }
+
+    let coloredTimeline = '';
+    if (showTerminalOutput) {
+      const colorResult = await executeWithWorkerFallback<string>(colorApiPath, 'GET');
+      if (!isWorkerFallback(colorResult) && typeof colorResult === 'string') {
+        coloredTimeline = colorResult.trim();
+      }
+    }
+
+    const platform = input.platform;
+
+    // Use colored timeline for display if available, otherwise fall back to
+    // plain markdown context (especially useful for platforms like Gemini
+    // where we want to ensure visibility even if colors aren't fetched).
+    const displayContent = coloredTimeline || (platform === 'gemini-cli' || platform === 'gemini' ? additionalContext : '');
+
+    const systemMessage = showTerminalOutput && displayContent
+      ? `${displayContent}\n\nView Observations Live @ http://localhost:${port}`
+      : undefined;
+
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'SessionStart',
+        additionalContext
+      },
+      systemMessage
+    };
   }
 };

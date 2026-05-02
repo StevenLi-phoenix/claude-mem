@@ -8,6 +8,7 @@ import path from 'path';
 import { existsSync, readFileSync } from 'fs';
 import { SessionStore } from '../sqlite/SessionStore.js';
 import { logger } from '../../utils/logger.js';
+import { SYSTEM_REMINDER_REGEX } from '../../utils/tag-stripping.js';
 import { CLAUDE_CONFIG_DIR } from '../../shared/paths.js';
 import type {
   ContextConfig,
@@ -34,19 +35,37 @@ export function queryObservations(
 
   return db.db.prepare(`
     SELECT
-      id, memory_session_id, type, title, subtitle, narrative,
-      facts, concepts, files_read, files_modified, discovery_tokens,
-      created_at, created_at_epoch
-    FROM observations
-    WHERE project = ?
+      o.id,
+      o.memory_session_id,
+      COALESCE(s.platform_source, 'claude') as platform_source,
+      o.type,
+      o.title,
+      o.subtitle,
+      o.narrative,
+      o.facts,
+      o.concepts,
+      o.files_read,
+      o.files_modified,
+      o.discovery_tokens,
+      o.created_at,
+      o.created_at_epoch
+    FROM observations o
+    LEFT JOIN sdk_sessions s ON o.memory_session_id = s.memory_session_id
+    WHERE (o.project = ? OR o.merged_into_project = ?)
       AND type IN (${typePlaceholders})
       AND EXISTS (
-        SELECT 1 FROM json_each(concepts)
+        SELECT 1 FROM json_each(o.concepts)
         WHERE value IN (${conceptPlaceholders})
       )
-    ORDER BY created_at_epoch DESC
+    ORDER BY o.created_at_epoch DESC
     LIMIT ?
-  `).all(project, ...typeArray, ...conceptArray, config.totalObservationCount) as Observation[];
+  `).all(
+    project,
+    project,
+    ...typeArray,
+    ...conceptArray,
+    config.totalObservationCount
+  ) as Observation[];
 }
 
 /**
@@ -58,12 +77,23 @@ export function querySummaries(
   config: ContextConfig
 ): SessionSummary[] {
   return db.db.prepare(`
-    SELECT id, memory_session_id, request, investigated, learned, completed, next_steps, created_at, created_at_epoch
-    FROM session_summaries
-    WHERE project = ?
-    ORDER BY created_at_epoch DESC
+    SELECT
+      ss.id,
+      ss.memory_session_id,
+      COALESCE(s.platform_source, 'claude') as platform_source,
+      ss.request,
+      ss.investigated,
+      ss.learned,
+      ss.completed,
+      ss.next_steps,
+      ss.created_at,
+      ss.created_at_epoch
+    FROM session_summaries ss
+    LEFT JOIN sdk_sessions s ON ss.memory_session_id = s.memory_session_id
+    WHERE (ss.project = ? OR ss.merged_into_project = ?)
+    ORDER BY ss.created_at_epoch DESC
     LIMIT ?
-  `).all(project, config.sessionCount + SUMMARY_LOOKAHEAD) as SessionSummary[];
+  `).all(project, project, config.sessionCount + SUMMARY_LOOKAHEAD) as SessionSummary[];
 }
 
 /**
@@ -87,19 +117,39 @@ export function queryObservationsMulti(
 
   return db.db.prepare(`
     SELECT
-      id, memory_session_id, type, title, subtitle, narrative,
-      facts, concepts, files_read, files_modified, discovery_tokens,
-      created_at, created_at_epoch, project
-    FROM observations
-    WHERE project IN (${projectPlaceholders})
+      o.id,
+      o.memory_session_id,
+      COALESCE(s.platform_source, 'claude') as platform_source,
+      o.type,
+      o.title,
+      o.subtitle,
+      o.narrative,
+      o.facts,
+      o.concepts,
+      o.files_read,
+      o.files_modified,
+      o.discovery_tokens,
+      o.created_at,
+      o.created_at_epoch,
+      o.project
+    FROM observations o
+    LEFT JOIN sdk_sessions s ON o.memory_session_id = s.memory_session_id
+    WHERE (o.project IN (${projectPlaceholders})
+           OR o.merged_into_project IN (${projectPlaceholders}))
       AND type IN (${typePlaceholders})
       AND EXISTS (
-        SELECT 1 FROM json_each(concepts)
+        SELECT 1 FROM json_each(o.concepts)
         WHERE value IN (${conceptPlaceholders})
       )
-    ORDER BY created_at_epoch DESC
+    ORDER BY o.created_at_epoch DESC
     LIMIT ?
-  `).all(...projects, ...typeArray, ...conceptArray, config.totalObservationCount) as Observation[];
+  `).all(
+    ...projects,
+    ...projects,
+    ...typeArray,
+    ...conceptArray,
+    config.totalObservationCount
+  ) as Observation[];
 }
 
 /**
@@ -117,12 +167,25 @@ export function querySummariesMulti(
   const projectPlaceholders = projects.map(() => '?').join(',');
 
   return db.db.prepare(`
-    SELECT id, memory_session_id, request, investigated, learned, completed, next_steps, created_at, created_at_epoch, project
-    FROM session_summaries
-    WHERE project IN (${projectPlaceholders})
-    ORDER BY created_at_epoch DESC
+    SELECT
+      ss.id,
+      ss.memory_session_id,
+      COALESCE(s.platform_source, 'claude') as platform_source,
+      ss.request,
+      ss.investigated,
+      ss.learned,
+      ss.completed,
+      ss.next_steps,
+      ss.created_at,
+      ss.created_at_epoch,
+      ss.project
+    FROM session_summaries ss
+    LEFT JOIN sdk_sessions s ON ss.memory_session_id = s.memory_session_id
+    WHERE (ss.project IN (${projectPlaceholders})
+           OR ss.merged_into_project IN (${projectPlaceholders}))
+    ORDER BY ss.created_at_epoch DESC
     LIMIT ?
-  `).all(...projects, config.sessionCount + SUMMARY_LOOKAHEAD) as SessionSummary[];
+  `).all(...projects, ...projects, config.sessionCount + SUMMARY_LOOKAHEAD) as SessionSummary[];
 }
 
 /**
@@ -133,52 +196,58 @@ function cwdToDashed(cwd: string): string {
 }
 
 /**
+ * Find the last assistant message text from parsed transcript lines.
+ */
+function parseAssistantTextFromLine(line: string): string | null {
+  if (!line.includes('"type":"assistant"')) return null;
+
+  const entry = JSON.parse(line);
+  if (entry.type === 'assistant' && entry.message?.content && Array.isArray(entry.message.content)) {
+    let text = '';
+    for (const block of entry.message.content) {
+      if (block.type === 'text') text += block.text;
+    }
+    text = text.replace(SYSTEM_REMINDER_REGEX, '').trim();
+    if (text) return text;
+  }
+  return null;
+}
+
+function findLastAssistantMessage(lines: string[]): string {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const result = parseAssistantTextFromLine(lines[i]);
+      if (result) return result;
+    } catch (parseError) {
+      if (parseError instanceof Error) {
+        logger.debug('WORKER', 'Skipping malformed transcript line', { lineIndex: i }, parseError);
+      } else {
+        logger.debug('WORKER', 'Skipping malformed transcript line', { lineIndex: i, error: String(parseError) });
+      }
+      continue;
+    }
+  }
+  return '';
+}
+
+/**
  * Extract prior messages from transcript file
  */
 export function extractPriorMessages(transcriptPath: string): PriorMessages {
   try {
-    if (!existsSync(transcriptPath)) {
-      return { userMessage: '', assistantMessage: '' };
-    }
-
+    if (!existsSync(transcriptPath)) return { userMessage: '', assistantMessage: '' };
     const content = readFileSync(transcriptPath, 'utf-8').trim();
-    if (!content) {
-      return { userMessage: '', assistantMessage: '' };
-    }
+    if (!content) return { userMessage: '', assistantMessage: '' };
 
     const lines = content.split('\n').filter(line => line.trim());
-    let lastAssistantMessage = '';
-
-    for (let i = lines.length - 1; i >= 0; i--) {
-      try {
-        const line = lines[i];
-        if (!line.includes('"type":"assistant"')) {
-          continue;
-        }
-
-        const entry = JSON.parse(line);
-        if (entry.type === 'assistant' && entry.message?.content && Array.isArray(entry.message.content)) {
-          let text = '';
-          for (const block of entry.message.content) {
-            if (block.type === 'text') {
-              text += block.text;
-            }
-          }
-          text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
-          if (text) {
-            lastAssistantMessage = text;
-            break;
-          }
-        }
-      } catch (parseError) {
-        logger.debug('PARSER', 'Skipping malformed transcript line', { lineIndex: i }, parseError as Error);
-        continue;
-      }
-    }
-
+    const lastAssistantMessage = findLastAssistantMessage(lines);
     return { userMessage: '', assistantMessage: lastAssistantMessage };
   } catch (error) {
-    logger.failure('WORKER', `Failed to extract prior messages from transcript`, { transcriptPath }, error as Error);
+    if (error instanceof Error) {
+      logger.failure('WORKER', 'Failed to extract prior messages from transcript', { transcriptPath }, error);
+    } else {
+      logger.warn('WORKER', 'Failed to extract prior messages from transcript', { transcriptPath, error: String(error) });
+    }
     return { userMessage: '', assistantMessage: '' };
   }
 }

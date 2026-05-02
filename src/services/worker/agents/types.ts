@@ -33,6 +33,7 @@ export interface ObservationSSEPayload {
   id: number;
   memory_session_id: string | null;
   session_id: string;
+  platform_source: string;
   type: string;
   title: string | null;
   subtitle: string | null;
@@ -50,6 +51,7 @@ export interface ObservationSSEPayload {
 export interface SummarySSEPayload {
   id: number;
   session_id: string;
+  platform_source: string;
   request: string | null;
   investigated: string | null;
   learned: string | null;
@@ -94,17 +96,6 @@ export interface ResponseProcessingContext {
 export interface ParsedResponse {
   observations: ParsedObservation[];
   summary: ParsedSummary | null;
-}
-
-// ============================================================================
-// Fallback Agent Interface
-// ============================================================================
-
-/**
- * Interface for fallback agent (used by Gemini/OpenRouter to fall back to Claude)
- */
-export interface FallbackAgent {
-  startSession(session: ActiveSession, worker?: WorkerRef): Promise<void>;
 }
 
 // ============================================================================

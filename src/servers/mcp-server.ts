@@ -16,7 +16,6 @@ import { logger } from '../utils/logger.js';
 // CRITICAL: Redirect console to stderr BEFORE other imports
 // MCP uses stdio transport where stdout is reserved for JSON-RPC protocol messages.
 // Any logs to stdout break the protocol (Claude Desktop parses "[2025..." as JSON array).
-const _originalLog = console['log'];
 console['log'] = (...args: any[]) => {
   logger.error('CONSOLE', 'Intercepted console output (MCP protocol protection)', undefined, { args });
 };
@@ -27,11 +26,71 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { workerHttpRequest } from '../shared/worker-utils.js';
+import { getWorkerPort, workerHttpRequest } from '../shared/worker-utils.js';
+import { ensureWorkerStarted } from '../services/worker-spawner.js';
 import { searchCodebase, formatSearchResults } from '../services/smart-file-read/search.js';
 import { parseFile, formatFoldedView, unfoldSymbol } from '../services/smart-file-read/parser.js';
 import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+// Resolve the path to worker-service.cjs, which lives alongside mcp-server.cjs
+// in the plugin's scripts directory. We need an explicit path because the MCP
+// server runs under Node while the worker must run under Bun, so we can't rely
+// on `__filename` pointing to a self-spawnable script.
+//
+// In the deployed CJS bundle, `__dirname` is always defined — the import.meta
+// fallback only exists to keep the source future-proof against an eventual
+// ESM port. Both fallback branches should be functionally unreachable today.
+let mcpServerDirResolutionFailed = false;
+const mcpServerDir = (() => {
+  if (typeof __dirname !== 'undefined') return __dirname;
+  try {
+    return dirname(fileURLToPath(import.meta.url));
+  } catch {
+    // Last-ditch fallback: cwd is almost certainly wrong, but throwing here
+    // would crash the MCP server before it can serve a single request. Mark
+    // the failure so the existence check below can produce a single, loud,
+    // root-cause-attributing log line instead of a confusing "missing worker
+    // bundle" warning that hides the dirname resolution failure.
+    mcpServerDirResolutionFailed = true;
+    return process.cwd();
+  }
+})();
+const WORKER_SCRIPT_PATH = resolve(mcpServerDir, 'worker-service.cjs');
+
+/**
+ * Surface a clear, actionable error if the worker bundle isn't where we
+ * expect. Without this check, a missing or partial install only fails later
+ * inside spawnDaemon as a generic "failed to spawn" message.
+ *
+ * If dirname resolution itself failed (extremely unlikely in CJS), attribute
+ * the missing-bundle warning to the root cause so the user doesn't waste time
+ * looking for an install bug that doesn't exist.
+ *
+ * Called lazily from `ensureWorkerConnection` (not at module load) so that
+ * tests or tools that import this module without booting the MCP server
+ * don't see noisy ERROR-level log lines for a worker they never intended
+ * to start. The check is cheap and idempotent, so calling it on every
+ * auto-start attempt is fine.
+ */
+function errorIfWorkerScriptMissing(): void {
+  // Only log here when the dirname resolution itself failed — that's the
+  // mcp-server-specific root cause attribution that the spawner cannot
+  // provide. The plain "missing bundle" case is already covered by the
+  // existsSync guard inside ensureWorkerStarted, and logging from both
+  // sites would produce a confusing double-log on the same code path.
+  if (!mcpServerDirResolutionFailed) return;
+  if (existsSync(WORKER_SCRIPT_PATH)) return;
+
+  logger.error(
+    'SYSTEM',
+    'mcp-server: dirname resolution failed (both __dirname and import.meta.url are unavailable). Fell back to process.cwd() and the resolved WORKER_SCRIPT_PATH does not exist. This is the actual problem — the worker bundle is fine, but mcp-server cannot locate it. Worker auto-start will fail until the dirname-resolution path is fixed.',
+    { workerScriptPath: WORKER_SCRIPT_PATH, mcpServerDir }
+  );
+}
 
 /**
  * Map tool names to Worker HTTP endpoints
@@ -50,17 +109,18 @@ async function callWorkerAPI(
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   logger.debug('SYSTEM', '→ Worker API', undefined, { endpoint, params });
 
-  try {
-    const searchParams = new URLSearchParams();
+  const searchParams = new URLSearchParams();
 
-    // Convert params to query string
-    for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined && value !== null) {
-        searchParams.append(key, String(value));
-      }
+  // Convert params to query string
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null) {
+      searchParams.append(key, String(value));
     }
+  }
 
-    const apiPath = `${endpoint}?${searchParams}`;
+  const apiPath = `${endpoint}?${searchParams}`;
+
+  try {
     const response = await workerHttpRequest(apiPath);
 
     if (!response.ok) {
@@ -74,8 +134,8 @@ async function callWorkerAPI(
 
     // Worker returns { content: [...] } format directly
     return data;
-  } catch (error) {
-    logger.error('SYSTEM', '← Worker API error', { endpoint }, error as Error);
+  } catch (error: unknown) {
+    logger.error('SYSTEM', '← Worker API error', { endpoint }, error instanceof Error ? error : new Error(String(error)));
     return {
       content: [{
         type: 'text' as const,
@@ -84,6 +144,33 @@ async function callWorkerAPI(
       isError: true
     };
   }
+}
+
+async function executeWorkerPostRequest(
+  endpoint: string,
+  body: Record<string, any>
+): Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+  const response = await workerHttpRequest(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Worker API error (${response.status}): ${errorText}`);
+  }
+
+  const data = await response.json();
+
+  logger.debug('HTTP', 'Worker API success (POST)', undefined, { endpoint });
+
+  return {
+    content: [{
+      type: 'text' as const,
+      text: JSON.stringify(data, null, 2)
+    }]
+  };
 }
 
 /**
@@ -96,30 +183,9 @@ async function callWorkerAPIPost(
   logger.debug('HTTP', 'Worker API request (POST)', undefined, { endpoint });
 
   try {
-    const response = await workerHttpRequest(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Worker API error (${response.status}): ${errorText}`);
-    }
-
-    const data = await response.json();
-
-    logger.debug('HTTP', 'Worker API success (POST)', undefined, { endpoint });
-
-    // Wrap raw data in MCP format
-    return {
-      content: [{
-        type: 'text' as const,
-        text: JSON.stringify(data, null, 2)
-      }]
-    };
-  } catch (error) {
-    logger.error('HTTP', 'Worker API error (POST)', { endpoint }, error as Error);
+    return await executeWorkerPostRequest(endpoint, body);
+  } catch (error: unknown) {
+    logger.error('HTTP', 'Worker API error (POST)', { endpoint }, error instanceof Error ? error : new Error(String(error)));
     return {
       content: [{
         type: 'text' as const,
@@ -137,9 +203,47 @@ async function verifyWorkerConnection(): Promise<boolean> {
   try {
     const response = await workerHttpRequest('/api/health');
     return response.ok;
-  } catch (error) {
+  } catch (error: unknown) {
     // Expected during worker startup or if worker is down
-    logger.debug('SYSTEM', 'Worker health check failed', {}, error as Error);
+    logger.debug('SYSTEM', 'Worker health check failed', {}, error instanceof Error ? error : new Error(String(error)));
+    return false;
+  }
+}
+
+/**
+ * Ensure Worker is available for Codex and other MCP-only clients.
+ * Claude hooks already start the worker; this path makes Codex turnkey.
+ */
+async function ensureWorkerConnection(): Promise<boolean> {
+  if (await verifyWorkerConnection()) {
+    return true;
+  }
+
+  logger.warn('SYSTEM', 'Worker not available, attempting auto-start for MCP client');
+
+  // Validate the worker bundle path lazily here (rather than at module load)
+  // so that tests/tools that import this module without booting the MCP
+  // server don't see noisy ERROR-level log lines for a worker they never
+  // intended to start.
+  errorIfWorkerScriptMissing();
+
+  try {
+    const port = getWorkerPort();
+    const started = await ensureWorkerStarted(port, WORKER_SCRIPT_PATH);
+    if (!started) {
+      logger.error(
+        'SYSTEM',
+        'Worker auto-start returned false — MCP tools that require the worker (search, timeline, get_observations) will fail until the worker is running. Check earlier log lines for the specific failure reason (Bun not found, missing worker bundle, port conflict, etc.).'
+      );
+    }
+    return started;
+  } catch (error: unknown) {
+    logger.error(
+      'SYSTEM',
+      'Worker auto-start threw — MCP tools that require the worker (search, timeline, get_observations) will fail until the worker is running.',
+      undefined,
+      error instanceof Error ? error : new Error(String(error))
+    );
     return false;
   }
 }
@@ -188,7 +292,17 @@ NEVER fetch full details without filtering first. 10x token savings.`,
     description: 'Step 1: Search memory. Returns index with IDs. Params: query, limit, project, type, obs_type, dateStart, dateEnd, offset, orderBy',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        query: { type: 'string', description: 'Search query' },
+        limit: { type: 'number', description: 'Max results (default 20)' },
+        project: { type: 'string', description: 'Filter by project name' },
+        type: { type: 'string', description: 'Filter by observation type' },
+        obs_type: { type: 'string', description: 'Filter by obs_type field' },
+        dateStart: { type: 'string', description: 'Start date filter (ISO)' },
+        dateEnd: { type: 'string', description: 'End date filter (ISO)' },
+        offset: { type: 'number', description: 'Pagination offset' },
+        orderBy: { type: 'string', description: 'Sort order: date_desc or date_asc' }
+      },
       additionalProperties: true
     },
     handler: async (args: any) => {
@@ -201,7 +315,13 @@ NEVER fetch full details without filtering first. 10x token savings.`,
     description: 'Step 2: Get context around results. Params: anchor (observation ID) OR query (finds anchor automatically), depth_before, depth_after, project',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        anchor: { type: 'number', description: 'Observation ID to center the timeline around' },
+        query: { type: 'string', description: 'Query to find anchor automatically' },
+        depth_before: { type: 'number', description: 'Items before anchor (default 3)' },
+        depth_after: { type: 'number', description: 'Items after anchor (default 3)' },
+        project: { type: 'string', description: 'Filter by project name' }
+      },
       additionalProperties: true
     },
     handler: async (args: any) => {
@@ -339,6 +459,111 @@ NEVER fetch full details without filtering first. 10x token savings.`,
         }]
       };
     }
+  },
+  {
+    name: 'build_corpus',
+    description: 'Build a knowledge corpus from filtered observations. Creates a queryable knowledge agent. Params: name (required), description, project, types (comma-separated), concepts (comma-separated), files (comma-separated), query, dateStart, dateEnd, limit',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Corpus name (used as filename)' },
+        description: { type: 'string', description: 'What this corpus is about' },
+        project: { type: 'string', description: 'Filter by project' },
+        types: { type: 'string', description: 'Comma-separated observation types: decision,bugfix,feature,refactor,discovery,change' },
+        concepts: { type: 'string', description: 'Comma-separated concepts to filter by' },
+        files: { type: 'string', description: 'Comma-separated file paths to filter by' },
+        query: { type: 'string', description: 'Semantic search query' },
+        dateStart: { type: 'string', description: 'Start date (ISO format)' },
+        dateEnd: { type: 'string', description: 'End date (ISO format)' },
+        limit: { type: 'number', description: 'Maximum observations (default 500)' }
+      },
+      required: ['name'],
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      return await callWorkerAPIPost('/api/corpus', args);
+    }
+  },
+  {
+    name: 'list_corpora',
+    description: 'List all knowledge corpora with their stats and priming status',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      return await callWorkerAPI('/api/corpus', args);
+    }
+  },
+  {
+    name: 'prime_corpus',
+    description: 'Prime a knowledge corpus — creates an AI session loaded with the corpus knowledge. Must be called before query_corpus.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the corpus to prime' }
+      },
+      required: ['name'],
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      const { name, ...rest } = args;
+      if (typeof name !== 'string' || name.trim() === '') throw new Error('Missing required argument: name');
+      return await callWorkerAPIPost(`/api/corpus/${encodeURIComponent(name)}/prime`, rest);
+    }
+  },
+  {
+    name: 'query_corpus',
+    description: 'Ask a question to a primed knowledge corpus. The corpus must be primed first with prime_corpus.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the corpus to query' },
+        question: { type: 'string', description: 'The question to ask' }
+      },
+      required: ['name', 'question'],
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      const { name, ...rest } = args;
+      if (typeof name !== 'string' || name.trim() === '') throw new Error('Missing required argument: name');
+      return await callWorkerAPIPost(`/api/corpus/${encodeURIComponent(name)}/query`, rest);
+    }
+  },
+  {
+    name: 'rebuild_corpus',
+    description: 'Rebuild a knowledge corpus from its stored filter — re-runs the search to refresh with new observations. Does not re-prime the session.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the corpus to rebuild' }
+      },
+      required: ['name'],
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      const { name, ...rest } = args;
+      if (typeof name !== 'string' || name.trim() === '') throw new Error('Missing required argument: name');
+      return await callWorkerAPIPost(`/api/corpus/${encodeURIComponent(name)}/rebuild`, rest);
+    }
+  },
+  {
+    name: 'reprime_corpus',
+    description: 'Create a fresh knowledge agent session for a corpus, clearing prior Q&A context. Use when conversation has drifted or after rebuilding.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Name of the corpus to reprime' }
+      },
+      required: ['name'],
+      additionalProperties: true
+    },
+    handler: async (args: any) => {
+      const { name, ...rest } = args;
+      if (typeof name !== 'string' || name.trim() === '') throw new Error('Missing required argument: name');
+      return await callWorkerAPIPost(`/api/corpus/${encodeURIComponent(name)}/reprime`, rest);
+    }
   }
 ];
 
@@ -376,8 +601,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   try {
     return await tool.handler(request.params.arguments || {});
-  } catch (error) {
-    logger.error('SYSTEM', 'Tool execution failed', { tool: request.params.name }, error as Error);
+  } catch (error: unknown) {
+    logger.error('SYSTEM', 'Tool execution failed', { tool: request.params.name }, error instanceof Error ? error : new Error(String(error)));
     return {
       content: [{
         type: 'text' as const,
@@ -392,6 +617,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // Prevents orphaned MCP server processes when Claude Code exits unexpectedly
 const HEARTBEAT_INTERVAL_MS = 30_000;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+let isCleaningUp = false;
+
+function handleStdioClosed() {
+  cleanup('stdio-closed');
+}
+
+function handleStdioError(error: Error) {
+  logger.warn('SYSTEM', 'MCP stdio stream errored, shutting down', {
+    message: error.message
+  });
+  cleanup('stdio-error');
+}
+
+function attachStdioLifecycle() {
+  process.stdin.on('end', handleStdioClosed);
+  process.stdin.on('close', handleStdioClosed);
+  process.stdin.on('error', handleStdioError);
+}
+
+function detachStdioLifecycle() {
+  process.stdin.off('end', handleStdioClosed);
+  process.stdin.off('close', handleStdioClosed);
+  process.stdin.off('error', handleStdioError);
+}
 
 function startParentHeartbeat() {
   // ppid-based orphan detection only works on Unix
@@ -414,9 +663,13 @@ function startParentHeartbeat() {
 
 // Cleanup function — synchronous to ensure consistent behavior whether called
 // from signal handlers, heartbeat interval, or awaited in async context
-function cleanup() {
+function cleanup(reason: string = 'shutdown') {
+  if (isCleaningUp) return;
+  isCleaningUp = true;
+
   if (heartbeatTimer) clearInterval(heartbeatTimer);
-  logger.info('SYSTEM', 'MCP server shutting down');
+  detachStdioLifecycle();
+  logger.info('SYSTEM', 'MCP server shutting down', { reason });
   process.exit(0);
 }
 
@@ -424,19 +677,66 @@ function cleanup() {
 process.on('SIGTERM', cleanup);
 process.on('SIGINT', cleanup);
 
+/**
+ * Issue #2174: When the IDE extension (e.g. Cursor's Claude Code) loses its
+ * marketplace directory at ~/.claude/plugins/marketplaces/<source>/, the
+ * extension's hook loader silently skips claude-mem hooks while the MCP
+ * server (this process) keeps working. The session becomes invisible to
+ * memory with no error surfaced.
+ *
+ * The MCP server is the one piece that DOES boot in this state, so we use
+ * it as the canary: detect the missing marketplace dir and emit a single
+ * loud, actionable warning. We don't run smart-install.js from here — the
+ * MCP server runs under the IDE's permission model, not the user's shell,
+ * so attempting an install at MCP startup creates more failure modes than
+ * it fixes. Instead we tell the user exactly what to do.
+ */
+function checkMarketplaceMarker(): void {
+  try {
+    // Use os.homedir() so this works on Windows (HOME is unset there;
+    // USERPROFILE is the Windows convention and homedir() picks it up).
+    const home = homedir();
+    const marketplaceCandidates = [
+      resolve(home, '.claude', 'plugins', 'marketplaces', 'thedotmack'),
+      resolve(home, '.config', 'claude', 'plugins', 'marketplaces', 'thedotmack'),
+    ];
+    const present = marketplaceCandidates.some(p => p && existsSync(p));
+    const cacheCandidates = [
+      resolve(home, '.claude', 'plugins', 'cache', 'thedotmack', 'claude-mem'),
+      resolve(home, '.config', 'claude', 'plugins', 'cache', 'thedotmack', 'claude-mem'),
+    ];
+    const cachePresent = cacheCandidates.some(p => p && existsSync(p));
+    const cacheRoot = cacheCandidates[0];
+
+    if (!present && cachePresent) {
+      logger.error(
+        'SYSTEM',
+        'claude-mem MCP started but no marketplace directory was found at ~/.claude/plugins/marketplaces/thedotmack or the XDG equivalent. The IDE plugin loader needs that directory to fire claude-mem hooks (SessionStart, PostToolUse, Stop, etc.). Without it, MCP search will work but no new memories will be captured. To self-heal, run: node ~/.claude/plugins/cache/thedotmack/claude-mem/*/scripts/smart-install.js (or reinstall the plugin from the marketplace).',
+        { marketplaceCandidates, cacheRoot }
+      );
+    }
+  } catch {
+    // Self-heal probe is best-effort; never fail MCP startup for it.
+  }
+}
+
 // Start the server
 async function main() {
   // Start the MCP server
   const transport = new StdioServerTransport();
+  attachStdioLifecycle();
   await server.connect(transport);
   logger.info('SYSTEM', 'Claude-mem search server started');
+
+  // Surface marketplace-dir corruption that silently disables hook loading
+  checkMarketplaceMarker();
 
   // Start parent heartbeat to detect orphaned MCP servers
   startParentHeartbeat();
 
   // Check Worker availability in background
   setTimeout(async () => {
-    const workerAvailable = await verifyWorkerConnection();
+    const workerAvailable = await ensureWorkerConnection();
     if (!workerAvailable) {
       logger.error('SYSTEM', 'Worker not available', undefined, {});
       logger.error('SYSTEM', 'Tools will fail until Worker is started');

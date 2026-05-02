@@ -6,9 +6,21 @@
  */
 
 import express, { Request, Response } from 'express';
+import { z } from 'zod';
 import { SearchManager } from '../../SearchManager.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
+import { validateBody } from '../middleware/validateBody.js';
 import { logger } from '../../../../utils/logger.js';
+import { groupByDate } from '../../../../shared/timeline-formatting.js';
+import type { ObservationSearchResult, SessionSummarySearchResult } from '../../../sqlite/types.js';
+
+// Plan 06 Phase 3 — per-route Zod schema. The semantic-context endpoint
+// also accepts query-string fallbacks, so the body itself is fully optional.
+const semanticContextSchema = z.object({
+  q: z.string().optional(),
+  project: z.string().optional(),
+  limit: z.union([z.string(), z.number()]).optional(),
+}).passthrough();
 
 export class SearchRoutes extends BaseRouteHandler {
   constructor(
@@ -38,7 +50,7 @@ export class SearchRoutes extends BaseRouteHandler {
     app.get('/api/context/timeline', this.handleGetContextTimeline.bind(this));
     app.get('/api/context/preview', this.handleContextPreview.bind(this));
     app.get('/api/context/inject', this.handleContextInject.bind(this));
-    app.post('/api/context/semantic', this.handleSemanticContext.bind(this));
+    app.post('/api/context/semantic', validateBody(semanticContextSchema), this.handleSemanticContext.bind(this));
 
     // Timeline and help endpoints
     app.get('/api/timeline/by-query', this.handleGetTimelineByQuery.bind(this));
@@ -120,28 +132,156 @@ export class SearchRoutes extends BaseRouteHandler {
   /**
    * Search observations by concept
    * GET /api/search/by-concept?concept=discovery&limit=5
+   *
+   * Chroma errors surface as 503 via ChromaUnavailableError (thrown by orchestrator).
    */
   private handleSearchByConcept = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const result = await this.searchManager.findByConcept(req.query);
-    res.json(result);
+    const orchestrator = this.searchManager.getOrchestrator();
+    const formatter = this.searchManager.getFormatter();
+    const query = req.query as Record<string, any>;
+    const rawConcept = query.concepts ?? query.concept;
+    const concept = Array.isArray(rawConcept) ? rawConcept[0] : rawConcept;
+    const strategyResult = await orchestrator.findByConcept(concept, query);
+    const observations = strategyResult.results.observations;
+
+    if (observations.length === 0) {
+      res.json({
+        content: [{
+          type: 'text' as const,
+          text: `No observations found with concept "${concept}"`
+        }]
+      });
+      return;
+    }
+
+    const header = `Found ${observations.length} observation(s) with concept "${concept}"\n\n${formatter.formatTableHeader()}`;
+    const rows = observations.map((obs: ObservationSearchResult, i: number) => formatter.formatObservationIndex(obs, i));
+    res.json({
+      content: [{
+        type: 'text' as const,
+        text: header + '\n' + rows.join('\n')
+      }]
+    });
   });
 
   /**
    * Search by file path
    * GET /api/search/by-file?filePath=...&limit=10
+   *
+   * Chroma errors surface as 503 via ChromaUnavailableError (thrown by orchestrator).
    */
   private handleSearchByFile = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const result = await this.searchManager.findByFile(req.query);
-    res.json(result);
+    const orchestrator = this.searchManager.getOrchestrator();
+    const formatter = this.searchManager.getFormatter();
+    const query = req.query as Record<string, any>;
+    // Accept both filePath and files for API compatibility
+    const rawFilePath = query.filePath ?? query.files;
+    const filePath = Array.isArray(rawFilePath)
+      ? rawFilePath[0]
+      : (typeof rawFilePath === 'string' && rawFilePath.includes(','))
+        ? rawFilePath.split(',')[0].trim()
+        : rawFilePath;
+
+    const { observations, sessions } = await orchestrator.findByFile(filePath, query);
+    const totalResults = observations.length + sessions.length;
+
+    if (totalResults === 0) {
+      res.json({
+        content: [{
+          type: 'text' as const,
+          text: `No results found for file "${filePath}"`
+        }]
+      });
+      return;
+    }
+
+    // Combine observations and sessions with timestamps for date grouping
+    const combined: Array<{
+      type: 'observation' | 'session';
+      data: ObservationSearchResult | SessionSummarySearchResult;
+      epoch: number;
+      created_at: string;
+    }> = [
+      ...observations.map((obs: ObservationSearchResult) => ({
+        type: 'observation' as const,
+        data: obs,
+        epoch: obs.created_at_epoch,
+        created_at: obs.created_at
+      })),
+      ...sessions.map((sess: SessionSummarySearchResult) => ({
+        type: 'session' as const,
+        data: sess,
+        epoch: sess.created_at_epoch,
+        created_at: sess.created_at
+      }))
+    ];
+
+    combined.sort((a, b) => b.epoch - a.epoch);
+    const resultsByDate = groupByDate(combined, item => item.created_at);
+
+    const lines: string[] = [];
+    lines.push(`Found ${totalResults} result(s) for file "${filePath}"`);
+    lines.push('');
+
+    for (const [day, dayResults] of resultsByDate) {
+      lines.push(`### ${day}`);
+      lines.push('');
+      lines.push(formatter.formatTableHeader());
+      for (const result of dayResults) {
+        if (result.type === 'observation') {
+          lines.push(formatter.formatObservationIndex(result.data as ObservationSearchResult, 0));
+        } else {
+          lines.push(formatter.formatSessionIndex(result.data as SessionSummarySearchResult, 0));
+        }
+      }
+      lines.push('');
+    }
+
+    res.json({
+      content: [{
+        type: 'text' as const,
+        text: lines.join('\n')
+      }]
+    });
   });
 
   /**
    * Search observations by type
    * GET /api/search/by-type?type=bugfix&limit=10
+   *
+   * Chroma errors surface as 503 via ChromaUnavailableError (thrown by orchestrator).
    */
   private handleSearchByType = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const result = await this.searchManager.findByType(req.query);
-    res.json(result);
+    const orchestrator = this.searchManager.getOrchestrator();
+    const formatter = this.searchManager.getFormatter();
+    const query = req.query as Record<string, any>;
+    const rawType = query.type;
+    const type = (typeof rawType === 'string' && rawType.includes(','))
+      ? rawType.split(',').map((s: string) => s.trim()).filter(Boolean)
+      : rawType;
+    const typeStr = Array.isArray(type) ? type.join(', ') : type;
+
+    const strategyResult = await orchestrator.findByType(type, query);
+    const observations = strategyResult.results.observations;
+
+    if (observations.length === 0) {
+      res.json({
+        content: [{
+          type: 'text' as const,
+          text: `No observations found with type "${typeStr}"`
+        }]
+      });
+      return;
+    }
+
+    const header = `Found ${observations.length} observation(s) with type "${typeStr}"\n\n${formatter.formatTableHeader()}`;
+    const rows = observations.map((obs: ObservationSearchResult, i: number) => formatter.formatObservationIndex(obs, i));
+    res.json({
+      content: [{
+        type: 'text' as const,
+        text: header + '\n' + rows.join('\n')
+      }]
+    });
   });
 
   /**
@@ -184,9 +324,10 @@ export class SearchRoutes extends BaseRouteHandler {
     const contextText = await generateContext(
       {
         session_id: 'preview-' + Date.now(),
-        cwd: cwd
+        cwd: cwd,
+        projects: [projectName]
       },
-      true  // useColors=true for ANSI terminal output
+      true  // forHuman=true for ANSI terminal output
     );
 
     // Return as plain text
@@ -208,7 +349,7 @@ export class SearchRoutes extends BaseRouteHandler {
   private handleContextInject = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
     // Support both legacy `project` and new `projects` parameter
     const projectsParam = (req.query.projects as string) || (req.query.project as string);
-    const useColors = req.query.colors === 'true';
+    const forHuman = req.query.colors === 'true';
     const full = req.query.full === 'true';
 
     if (!projectsParam) {
@@ -239,7 +380,7 @@ export class SearchRoutes extends BaseRouteHandler {
         projects: projects,
         full
       },
-      useColors
+      forHuman
     );
 
     // Return as plain text
@@ -264,35 +405,34 @@ export class SearchRoutes extends BaseRouteHandler {
       return;
     }
 
+    let result: any;
     try {
-      const result = await this.searchManager.search({
-        query,
-        type: 'observations',
-        project,
-        limit: String(limit),
-        format: 'json'
+      result = await this.searchManager.search({
+        query, type: 'observations', project, limit: String(limit), format: 'json'
       });
-
-      const observations = (result as any)?.observations || [];
-      if (!observations.length) {
-        res.json({ context: '', count: 0 });
-        return;
-      }
-
-      // Format as compact markdown for context injection
-      const lines: string[] = ['## Relevant Past Work (semantic match)\n'];
-      for (const obs of observations.slice(0, limit)) {
-        const date = obs.created_at?.slice(0, 10) || '';
-        lines.push(`### ${obs.title || 'Observation'} (${date})`);
-        if (obs.narrative) lines.push(obs.narrative);
-        lines.push('');
-      }
-
-      res.json({ context: lines.join('\n'), count: observations.length });
     } catch (error) {
-      logger.error('SEARCH', 'Semantic context query failed', {}, error as Error);
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
+      logger.error('HTTP', 'Semantic context query failed', { query, project }, normalizedError);
       res.json({ context: '', count: 0 });
+      return;
     }
+
+    const observations = result?.observations || [];
+    if (!observations.length) {
+      res.json({ context: '', count: 0 });
+      return;
+    }
+
+    // Format as compact markdown for context injection
+    const lines: string[] = ['## Relevant Past Work (semantic match)\n'];
+    for (const obs of observations.slice(0, limit)) {
+      const date = obs.created_at?.slice(0, 10) || '';
+      lines.push(`### ${obs.title || 'Observation'} (${date})`);
+      if (obs.narrative) lines.push(obs.narrative);
+      lines.push('');
+    }
+
+    res.json({ context: lines.join('\n'), count: observations.length });
   });
 
   /**
@@ -309,6 +449,10 @@ export class SearchRoutes extends BaseRouteHandler {
    * GET /api/search/help
    */
   private handleSearchHelp = this.wrapHandler((req: Request, res: Response): void => {
+    // Use the actual host:port the request came in on so example URLs always
+    // round-trip back to this same worker — matters for multi-account / non-
+    // default-port setups (#2101, #2103).
+    const baseUrl = `http://${req.headers.host ?? 'localhost'}`;
     res.json({
       title: 'Claude-Mem Search API',
       description: 'HTTP API for searching persistent memory',
@@ -411,10 +555,10 @@ export class SearchRoutes extends BaseRouteHandler {
         }
       ],
       examples: [
-        'curl "http://localhost:37777/api/search/observations?query=authentication&limit=5"',
-        'curl "http://localhost:37777/api/search/by-type?type=bugfix&limit=10"',
-        'curl "http://localhost:37777/api/context/recent?project=claude-mem&limit=3"',
-        'curl "http://localhost:37777/api/context/timeline?anchor=123&depth_before=5&depth_after=5"'
+        `curl "${baseUrl}/api/search/observations?query=authentication&limit=5"`,
+        `curl "${baseUrl}/api/search/by-type?type=bugfix&limit=10"`,
+        `curl "${baseUrl}/api/context/recent?project=claude-mem&limit=3"`,
+        `curl "${baseUrl}/api/context/timeline?anchor=123&depth_before=5&depth_after=5"`
       ]
     });
   });

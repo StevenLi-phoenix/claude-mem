@@ -6,6 +6,7 @@
  */
 
 import express, { Request, Response } from 'express';
+import { z } from 'zod';
 import path from 'path';
 import { readFileSync, writeFileSync, existsSync, renameSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
@@ -13,10 +14,26 @@ import { getPackageRoot } from '../../../../shared/paths.js';
 import { logger } from '../../../../utils/logger.js';
 import { SettingsManager } from '../../SettingsManager.js';
 import { getBranchInfo, switchBranch, pullUpdates } from '../../BranchManager.js';
-import { ModeManager } from '../../domain/ModeManager.js';
+import { ModeManager } from '../../../domain/ModeManager.js';
 import { BaseRouteHandler } from '../BaseRouteHandler.js';
+import { validateBody } from '../middleware/validateBody.js';
 import { SettingsDefaultsManager } from '../../../../shared/SettingsDefaultsManager.js';
 import { clearPortCache } from '../../../../shared/worker-utils.js';
+
+// Plan 06 Phase 3 — per-route Zod schemas. Semantic validation of individual
+// CLAUDE_MEM_* keys still happens inside `validateSettings()` because the
+// allowed-value rules are richer than what Zod expresses here.
+const updateSettingsSchema = z.object({}).passthrough();
+
+const toggleMcpSchema = z.object({
+  enabled: z.boolean(),
+}).passthrough();
+
+const switchBranchSchema = z.object({
+  branch: z.string().min(1),
+}).passthrough();
+
+const updateBranchSchema = z.object({}).passthrough();
 
 export class SettingsRoutes extends BaseRouteHandler {
   constructor(
@@ -28,16 +45,16 @@ export class SettingsRoutes extends BaseRouteHandler {
   setupRoutes(app: express.Application): void {
     // Settings endpoints
     app.get('/api/settings', this.handleGetSettings.bind(this));
-    app.post('/api/settings', this.handleUpdateSettings.bind(this));
+    app.post('/api/settings', validateBody(updateSettingsSchema), this.handleUpdateSettings.bind(this));
 
     // MCP toggle endpoints
     app.get('/api/mcp/status', this.handleGetMcpStatus.bind(this));
-    app.post('/api/mcp/toggle', this.handleToggleMcp.bind(this));
+    app.post('/api/mcp/toggle', validateBody(toggleMcpSchema), this.handleToggleMcp.bind(this));
 
     // Branch switching endpoints
     app.get('/api/branch/status', this.handleGetBranchStatus.bind(this));
-    app.post('/api/branch/switch', this.handleSwitchBranch.bind(this));
-    app.post('/api/branch/update', this.handleUpdateBranch.bind(this));
+    app.post('/api/branch/switch', validateBody(switchBranchSchema), this.handleSwitchBranch.bind(this));
+    app.post('/api/branch/update', validateBody(updateBranchSchema), this.handleUpdateBranch.bind(this));
   }
 
   /**
@@ -74,7 +91,8 @@ export class SettingsRoutes extends BaseRouteHandler {
       try {
         settings = JSON.parse(settingsData);
       } catch (parseError) {
-        logger.error('SETTINGS', 'Failed to parse settings file', { settingsPath }, parseError as Error);
+        const normalizedParseError = parseError instanceof Error ? parseError : new Error(String(parseError));
+        logger.error('HTTP', 'Failed to parse settings file', { settingsPath }, normalizedParseError);
         res.status(500).json({
           success: false,
           error: 'Settings file is corrupted. Delete ~/.claude-mem/settings.json to reset.'
@@ -94,6 +112,8 @@ export class SettingsRoutes extends BaseRouteHandler {
       'CLAUDE_MEM_GEMINI_API_KEY',
       'CLAUDE_MEM_GEMINI_MODEL',
       'CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED',
+      'CLAUDE_MEM_GEMINI_MAX_CONTEXT_MESSAGES',
+      'CLAUDE_MEM_GEMINI_MAX_TOKENS',
       // OpenRouter Configuration
       'CLAUDE_MEM_OPENROUTER_API_KEY',
       'CLAUDE_MEM_OPENROUTER_MODEL',
@@ -153,12 +173,7 @@ export class SettingsRoutes extends BaseRouteHandler {
    * Body: { enabled: boolean }
    */
   private handleToggleMcp = this.wrapHandler((req: Request, res: Response): void => {
-    const { enabled } = req.body;
-
-    if (typeof enabled !== 'boolean') {
-      this.badRequest(res, 'enabled must be a boolean');
-      return;
-    }
+    const { enabled } = req.body as z.infer<typeof toggleMcpSchema>;
 
     this.toggleMcp(enabled);
     res.json({ success: true, enabled: this.isMcpEnabled() });
@@ -177,12 +192,7 @@ export class SettingsRoutes extends BaseRouteHandler {
    * Body: { branch: "main" | "beta/7.0" }
    */
   private handleSwitchBranch = this.wrapHandler(async (req: Request, res: Response): Promise<void> => {
-    const { branch } = req.body;
-
-    if (!branch) {
-      res.status(400).json({ success: false, error: 'Missing branch parameter' });
-      return;
-    }
+    const { branch } = req.body as z.infer<typeof switchBranchSchema>;
 
     // Validate branch name
     const allowedBranches = ['main', 'beta/7.0', 'feature/bun-executable'];
@@ -245,6 +255,22 @@ export class SettingsRoutes extends BaseRouteHandler {
       const validGeminiModels = ['gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-3-flash-preview'];
       if (!validGeminiModels.includes(settings.CLAUDE_MEM_GEMINI_MODEL)) {
         return { valid: false, error: 'CLAUDE_MEM_GEMINI_MODEL must be one of: gemini-2.5-flash-lite, gemini-2.5-flash, gemini-3-flash-preview' };
+      }
+    }
+
+    // Validate CLAUDE_MEM_GEMINI_MAX_CONTEXT_MESSAGES
+    if (settings.CLAUDE_MEM_GEMINI_MAX_CONTEXT_MESSAGES) {
+      const count = parseInt(settings.CLAUDE_MEM_GEMINI_MAX_CONTEXT_MESSAGES, 10);
+      if (isNaN(count) || count < 1 || count > 100) {
+        return { valid: false, error: 'CLAUDE_MEM_GEMINI_MAX_CONTEXT_MESSAGES must be between 1 and 100' };
+      }
+    }
+
+    // Validate CLAUDE_MEM_GEMINI_MAX_TOKENS
+    if (settings.CLAUDE_MEM_GEMINI_MAX_TOKENS) {
+      const tokens = parseInt(settings.CLAUDE_MEM_GEMINI_MAX_TOKENS, 10);
+      if (isNaN(tokens) || tokens < 1000 || tokens > 1000000) {
+        return { valid: false, error: 'CLAUDE_MEM_GEMINI_MAX_TOKENS must be between 1000 and 1000000' };
       }
     }
 

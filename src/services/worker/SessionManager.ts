@@ -14,8 +14,9 @@ import { logger } from '../../utils/logger.js';
 import type { ActiveSession, PendingMessage, PendingMessageWithId, ObservationData } from '../worker-types.js';
 import { PendingMessageStore } from '../sqlite/PendingMessageStore.js';
 import { SessionQueueProcessor } from '../queue/SessionQueueProcessor.js';
-import { getProcessBySession, ensureProcessExit } from './ProcessRegistry.js';
+import { getSdkProcessForSession, ensureSdkProcessExit } from '../../supervisor/process-registry.js';
 import { getSupervisor } from '../../supervisor/index.js';
+import { RestartGuard } from './RestartGuard.js';
 
 export class SessionManager {
   private dbManager: DatabaseManager;
@@ -76,6 +77,9 @@ export class SessionManager {
           newProject: dbSession.project
         });
         session.project = dbSession.project;
+      }
+      if (dbSession.platform_source && dbSession.platform_source !== session.platformSource) {
+        session.platformSource = dbSession.platform_source;
       }
 
       // Update userPrompt for continuation prompts
@@ -144,6 +148,7 @@ export class SessionManager {
       contentSessionId: dbSession.content_session_id,
       memorySessionId: null,  // Always start fresh - SDK will capture new ID
       project: dbSession.project,
+      platformSource: dbSession.platform_source,
       userPrompt,
       pendingMessages: [],
       abortController: new AbortController(),
@@ -155,9 +160,12 @@ export class SessionManager {
       earliestPendingTimestamp: null,
       conversationHistory: [],  // Initialize empty - will be populated by agents
       currentProvider: null,  // Will be set when generator starts
-      consecutiveRestarts: 0,  // Track consecutive restart attempts to prevent infinite loops
+      consecutiveRestarts: 0,  // DEPRECATED: use restartGuard. Kept for logging compat.
+      restartGuard: new RestartGuard(),
       processingMessageIds: [],  // CLAIM-CONFIRM: Track message IDs for confirmProcessed()
-      lastGeneratorActivity: Date.now()  // Initialize for stale detection (Issue #1099)
+      lastGeneratorActivity: Date.now(),  // Initialize for stale detection (Issue #1099)
+      pendingAgentId: null,   // Subagent identity carried from the most recent claimed message
+      pendingAgentType: null  // (null for main-session messages)
     };
 
     logger.debug('SESSION', 'Creating new session object (memorySessionId cleared to prevent stale resume)', {
@@ -213,21 +221,42 @@ export class SessionManager {
       tool_input: data.tool_input,
       tool_response: data.tool_response,
       prompt_number: data.prompt_number,
-      cwd: data.cwd
+      cwd: data.cwd,
+      agentId: data.agentId,
+      agentType: data.agentType,
+      toolUseId: data.toolUseId,
     };
 
     try {
       const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
       const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
       const toolSummary = logger.formatTool(data.tool_name, data.tool_input);
-      logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {
-        sessionId: sessionDbId
-      });
+      // enqueue returns 0 on INSERT OR IGNORE conflict (UNIQUE(session_id, tool_use_id)
+      // — Plan 01 Phase 1). The duplicate is correctly suppressed by the DB; surface
+      // it visibly so it isn't misread as "messageId=0 was inserted." Per
+      // Principle 3 (UNIQUE constraint over dedup window) this is the success path
+      // for replayed transcript lines, not an error.
+      if (messageId === 0) {
+        logger.debug('QUEUE', `DUP_SUPPRESSED | sessionDbId=${sessionDbId} | type=observation | tool=${toolSummary} | toolUseId=${data.toolUseId ?? 'null'} | depth=${queueDepth}`, {
+          sessionId: sessionDbId
+        });
+      } else {
+        logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=observation | tool=${toolSummary} | depth=${queueDepth}`, {
+          sessionId: sessionDbId
+        });
+      }
     } catch (error) {
-      logger.error('SESSION', 'Failed to persist observation to DB', {
-        sessionId: sessionDbId,
-        tool: data.tool_name
-      }, error);
+      if (error instanceof Error) {
+        logger.error('SESSION', 'Failed to persist observation to DB', {
+          sessionId: sessionDbId,
+          tool: data.tool_name
+        }, error);
+      } else {
+        logger.error('SESSION', 'Failed to persist observation to DB with non-Error', {
+          sessionId: sessionDbId,
+          tool: data.tool_name
+        }, new Error(String(error)));
+      }
       throw error; // Don't continue if we can't persist
     }
 
@@ -250,6 +279,11 @@ export class SessionManager {
       session = this.initializeSession(sessionDbId);
     }
 
+    // PATHFINDER plan 03 phase 3: summary-failure circuit breaker deleted.
+    // Each failed parse is independently marked failed via the retry ladder
+    // in PendingMessageStore.markFailed; a storm of bad parses surfaces as
+    // retry exhaustion, not as silent suppression of further requests.
+
     // CRITICAL: Persist to database FIRST
     const message: PendingMessage = {
       type: 'summarize',
@@ -259,13 +293,26 @@ export class SessionManager {
     try {
       const messageId = this.getPendingStore().enqueue(sessionDbId, session.contentSessionId, message);
       const queueDepth = this.getPendingStore().getPendingCount(sessionDbId);
-      logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=summarize | depth=${queueDepth}`, {
-        sessionId: sessionDbId
-      });
+      // See queueObservation note: messageId=0 means UNIQUE-suppressed duplicate.
+      if (messageId === 0) {
+        logger.debug('QUEUE', `DUP_SUPPRESSED | sessionDbId=${sessionDbId} | type=summarize | depth=${queueDepth}`, {
+          sessionId: sessionDbId
+        });
+      } else {
+        logger.info('QUEUE', `ENQUEUED | sessionDbId=${sessionDbId} | messageId=${messageId} | type=summarize | depth=${queueDepth}`, {
+          sessionId: sessionDbId
+        });
+      }
     } catch (error) {
-      logger.error('SESSION', 'Failed to persist summarize to DB', {
-        sessionId: sessionDbId
-      }, error);
+      if (error instanceof Error) {
+        logger.error('SESSION', 'Failed to persist summarize to DB', {
+          sessionId: sessionDbId
+        }, error);
+      } else {
+        logger.error('SESSION', 'Failed to persist summarize to DB with non-Error', {
+          sessionId: sessionDbId
+        }, new Error(String(error)));
+      }
       throw error; // Don't continue if we can't persist
     }
 
@@ -301,25 +348,33 @@ export class SessionManager {
       });
     }
 
-    // 3. Verify subprocess exit with 5s timeout (Issue #737 fix)
-    const tracked = getProcessBySession(sessionDbId);
+    // 3. Verify subprocess exit with 5s timeout. Process-group teardown is
+    //    used internally so any SDK descendants are killed too (Principle 5).
+    const tracked = getSdkProcessForSession(sessionDbId);
     if (tracked && tracked.process.exitCode === null) {
-      logger.debug('SESSION', `Waiting for subprocess PID ${tracked.pid} to exit`, {
+      logger.debug('SESSION', `Waiting for subprocess PID ${tracked.pid} (pgid ${tracked.pgid}) to exit`, {
         sessionId: sessionDbId,
-        pid: tracked.pid
+        pid: tracked.pid,
+        pgid: tracked.pgid
       });
-      await ensureProcessExit(tracked, 5000);
+      await ensureSdkProcessExit(tracked, 5000);
     }
 
     // 3b. Reap all supervisor-tracked processes for this session (#1351)
-    // This catches MCP servers and other child processes not tracked by the
-    // in-memory ProcessRegistry (e.g. processes registered only in supervisor.json).
+    // Catches MCP servers and other child processes registered only in
+    // supervisor.json that the in-process tracking would not see.
     try {
       await getSupervisor().getRegistry().reapSession(sessionDbId);
     } catch (error) {
-      logger.warn('SESSION', 'Supervisor reapSession failed (non-blocking)', {
-        sessionId: sessionDbId
-      }, error as Error);
+      if (error instanceof Error) {
+        logger.warn('SESSION', 'Supervisor reapSession failed (non-blocking)', {
+          sessionId: sessionDbId
+        }, error);
+      } else {
+        logger.warn('SESSION', 'Supervisor reapSession failed (non-blocking) with non-Error', {
+          sessionId: sessionDbId
+        }, new Error(String(error)));
+      }
     }
 
     // 4. Cleanup
@@ -358,39 +413,6 @@ export class SessionManager {
     if (this.onSessionDeletedCallback) {
       this.onSessionDeletedCallback();
     }
-  }
-
-  private static readonly MAX_SESSION_IDLE_MS = 15 * 60 * 1000; // 15 minutes
-
-  /**
-   * Reap sessions with no active generator and no pending work that have been idle too long.
-   * This unblocks the orphan reaper which skips processes for "active" sessions. (Issue #1168)
-   */
-  async reapStaleSessions(): Promise<number> {
-    const now = Date.now();
-    const staleSessionIds: number[] = [];
-
-    for (const [sessionDbId, session] of this.sessions) {
-      // Skip sessions with active generators
-      if (session.generatorPromise) continue;
-
-      // Skip sessions with pending work
-      const pendingCount = this.getPendingStore().getPendingCount(sessionDbId);
-      if (pendingCount > 0) continue;
-
-      // No generator + no pending work + old enough = stale
-      const sessionAge = now - session.startTime;
-      if (sessionAge > SessionManager.MAX_SESSION_IDLE_MS) {
-        staleSessionIds.push(sessionDbId);
-      }
-    }
-
-    for (const sessionDbId of staleSessionIds) {
-      logger.warn('SESSION', `Reaping stale session ${sessionDbId} (no activity for >${Math.round(SessionManager.MAX_SESSION_IDLE_MS / 60000)}m)`, { sessionDbId });
-      await this.deleteSession(sessionDbId);
-    }
-
-    return staleSessionIds.length;
   }
 
   /**

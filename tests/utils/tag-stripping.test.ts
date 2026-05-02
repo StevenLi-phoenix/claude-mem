@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
-import { stripMemoryTagsFromPrompt, stripMemoryTagsFromJson } from '../../src/utils/tag-stripping.js';
+import { stripMemoryTagsFromPrompt, stripMemoryTagsFromJson, isInternalProtocolPayload } from '../../src/utils/tag-stripping.js';
 import { logger } from '../../src/utils/logger.js';
 
 // Suppress logger output during tests
@@ -48,6 +48,12 @@ describe('Tag Stripping Utilities', () => {
         const input = '<private>secret</private> public <claude-mem-context>context</claude-mem-context> end';
         const result = stripMemoryTagsFromPrompt(input);
         expect(result).toBe('public  end');
+      });
+
+      it('should strip <persisted-output> tags', () => {
+        const input = 'public <persisted-output>large output</persisted-output> after';
+        const result = stripMemoryTagsFromPrompt(input);
+        expect(result).toBe('public  after');
       });
     });
 
@@ -230,6 +236,15 @@ finish`;
         const parsed = JSON.parse(result);
         expect(parsed.output).toBe('result ');
       });
+
+      it('should strip persisted-output tags from JSON', () => {
+        const jsonContent = JSON.stringify({
+          output: '<persisted-output>big output</persisted-output> keep'
+        });
+        const result = stripMemoryTagsFromJson(jsonContent);
+        const parsed = JSON.parse(result);
+        expect(parsed.output).toBe(' keep');
+      });
     });
 
     describe('edge cases', () => {
@@ -325,6 +340,56 @@ after`;
     });
   });
 
+  describe('system-reminder tag stripping', () => {
+    it('should strip single <system-reminder> tag from prompt', () => {
+      const input = 'user content <system-reminder>CLAUDE.md contents here</system-reminder> more content';
+      const result = stripMemoryTagsFromPrompt(input);
+      expect(result).toBe('user content  more content');
+    });
+
+    it('should strip <system-reminder> mixed with other tag types', () => {
+      const input = '<system-reminder>reminder</system-reminder> public <private>secret</private> <claude-mem-context>ctx</claude-mem-context> end';
+      const result = stripMemoryTagsFromPrompt(input);
+      expect(result).toBe('public   end');
+    });
+
+    it('should return empty string for entirely <system-reminder> content', () => {
+      const input = '<system-reminder>entire content is a system reminder</system-reminder>';
+      const result = stripMemoryTagsFromPrompt(input);
+      expect(result).toBe('');
+    });
+
+    it('should strip <system-reminder> tags from JSON content', () => {
+      const jsonContent = JSON.stringify({
+        data: '<system-reminder>injected reminder</system-reminder> real data'
+      });
+      const result = stripMemoryTagsFromJson(jsonContent);
+      const parsed = JSON.parse(result);
+      expect(parsed.data).toBe(' real data');
+    });
+
+    it('should strip multiline content within <system-reminder> tags', () => {
+      const input = `before
+<system-reminder>
+Contents of /path/to/CLAUDE.md:
+
+<claude-mem-context>
+# Recent Activity
+- Item 1
+</claude-mem-context>
+</system-reminder>
+after`;
+      const result = stripMemoryTagsFromPrompt(input);
+      expect(result).toBe('before\n\nafter');
+    });
+
+    it('should strip realistic tool result with nested CLAUDE.md content', () => {
+      const input = `Here is the file content.\n\n<system-reminder>\nContents of /project/src/CLAUDE.md:\n\n<claude-mem-context>\n# Recent Activity\n\n### Dec 14, 2025\n| ID | Time | Title |\n|-----|------|-------|\n| #123 | 11:30 PM | Some observation |\n</claude-mem-context>\n</system-reminder>`;
+      const result = stripMemoryTagsFromPrompt(input);
+      expect(result).toBe('Here is the file content.');
+    });
+  });
+
   describe('privacy enforcement integration', () => {
     it('should allow empty result to trigger privacy skip', () => {
       // Simulates what SessionRoutes does with private-only prompts
@@ -343,6 +408,62 @@ after`;
       const shouldSkip = !cleanedPrompt || cleanedPrompt.trim() === '';
       expect(shouldSkip).toBe(false);
       expect(cleanedPrompt.trim()).toBe('Please help me with my code');
+    });
+  });
+
+  describe('isInternalProtocolPayload', () => {
+    it('returns false for empty input', () => {
+      expect(isInternalProtocolPayload('')).toBe(false);
+    });
+
+    it('returns true for a bare task-notification block', () => {
+      expect(isInternalProtocolPayload('<task-notification>agent done</task-notification>')).toBe(true);
+    });
+
+    it('returns true for an empty-body task-notification block', () => {
+      expect(isInternalProtocolPayload('<task-notification></task-notification>')).toBe(true);
+    });
+
+    it('returns true with surrounding whitespace', () => {
+      expect(isInternalProtocolPayload('\n  <task-notification>x</task-notification>\n')).toBe(true);
+    });
+
+    it('returns true for multi-line payload', () => {
+      const payload = '<task-notification>\nline1\nline2\n</task-notification>';
+      expect(isInternalProtocolPayload(payload)).toBe(true);
+    });
+
+    it('returns true when tag has attributes', () => {
+      expect(isInternalProtocolPayload('<task-notification data-id="42">x</task-notification>')).toBe(true);
+    });
+
+    it('returns false for partial / unclosed tag', () => {
+      expect(isInternalProtocolPayload('<task-notification>oops')).toBe(false);
+    });
+
+    it('returns false when surrounded by user text', () => {
+      const text = 'hi <task-notification>x</task-notification> more';
+      expect(isInternalProtocolPayload(text)).toBe(false);
+    });
+
+    it('returns false for unrelated tags', () => {
+      expect(isInternalProtocolPayload('<private>secret</private>')).toBe(false);
+      expect(isInternalProtocolPayload('<system-reminder>hi</system-reminder>')).toBe(false);
+    });
+
+    it('returns false for over-large input', () => {
+      const huge = '<task-notification>' + 'a'.repeat(300 * 1024);
+      expect(isInternalProtocolPayload(huge)).toBe(false);
+    });
+
+    it('returns false for two protocol blocks separated by user text', () => {
+      const text = '<task-notification>a</task-notification> hello <task-notification>b</task-notification>';
+      expect(isInternalProtocolPayload(text)).toBe(false);
+    });
+
+    it('returns false for two adjacent protocol blocks (deliberate: deny-list per single block, not concatenations)', () => {
+      const text = '<task-notification>a</task-notification><task-notification>b</task-notification>';
+      expect(isInternalProtocolPayload(text)).toBe(false);
     });
   });
 });

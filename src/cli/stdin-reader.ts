@@ -6,6 +6,18 @@
 // Solution: JSON is self-delimiting. We detect complete JSON by attempting
 // to parse after each chunk. Once we have valid JSON, we resolve immediately
 // without waiting for EOF. This is the proper fix, not a timeout workaround.
+//
+// Resolve/reject contract:
+//   - Resolves with parsed JSON value when stdin yields valid JSON.
+//   - Resolves with `undefined` when stdin is unavailable, closes empty,
+//     or emits a stream error.
+//   - Rejects with an Error when stdin closes (or the safety timeout fires)
+//     after non-empty bytes that never form valid JSON. Malformed input is
+//     a handler/client bug — surfacing it lets the upstream exit-code
+//     strategy treat it as a blocking error (exit 2) rather than silently
+//     proceeding as if no input was given. (#2089)
+
+import { logger } from '../utils/logger.js';
 
 /**
  * Check if stdin is available and readable.
@@ -29,9 +41,10 @@ function isStdinAvailable(): boolean {
     // eslint-disable-next-line @typescript-eslint/no-unused-expressions
     stdin.readable;
     return true;
-  } catch {
+  } catch (error) {
     // Bun crashed trying to access stdin (EINVAL from fstat)
     // This is expected when Claude Code doesn't provide valid stdin
+    logger.debug('HOOK', 'stdin not available (expected for some runtimes)', { error: error instanceof Error ? error.message : String(error) });
     return false;
   }
 }
@@ -49,8 +62,9 @@ function tryParseJson(input: string): { success: true; value: unknown } | { succ
   try {
     const value = JSON.parse(trimmed);
     return { success: true, value };
-  } catch {
-    // JSON is incomplete or invalid
+  } catch (error) {
+    // JSON is incomplete or invalid — expected during incremental parsing
+    logger.debug('HOOK', 'JSON parse attempt incomplete', { error: error instanceof Error ? error.message : String(error) });
     return { success: false };
   }
 }
@@ -128,47 +142,58 @@ export async function readJsonFromStdin(): Promise<unknown> {
       }
     }, SAFETY_TIMEOUT_MS);
 
-    try {
-      process.stdin.on('data', (chunk) => {
-        input += chunk;
+    const onData = (chunk: Buffer | string) => {
+      input += chunk;
 
-        // Clear any pending parse delay
-        if (parseDelayId) {
-          clearTimeout(parseDelayId);
-          parseDelayId = null;
-        }
+      // Clear any pending parse delay
+      if (parseDelayId) {
+        clearTimeout(parseDelayId);
+        parseDelayId = null;
+      }
 
-        // Try to parse immediately - if JSON is complete, resolve now
-        if (tryResolveWithJson()) {
-          return;
-        }
+      // Try to parse immediately - if JSON is complete, resolve now
+      if (tryResolveWithJson()) {
+        return;
+      }
 
-        // If immediate parse failed, set a short delay and try again
-        // This handles multi-chunk delivery where the last chunk completes the JSON
-        parseDelayId = setTimeout(() => {
-          tryResolveWithJson();
-        }, PARSE_DELAY_MS);
-      });
+      // If immediate parse failed, set a short delay and try again
+      // This handles multi-chunk delivery where the last chunk completes the JSON
+      parseDelayId = setTimeout(() => {
+        tryResolveWithJson();
+      }, PARSE_DELAY_MS);
+    };
 
-      process.stdin.on('end', () => {
-        // stdin closed - parse whatever we have
-        if (!resolved) {
-          if (!tryResolveWithJson()) {
-            // Empty or invalid - resolve with undefined
-            resolveWith(input.trim() ? undefined : undefined);
+    const onEnd = () => {
+      // stdin closed - parse whatever we have
+      if (!resolved) {
+        if (!tryResolveWithJson()) {
+          // Mirror the safety-timeout semantics (#2089):
+          // non-empty bytes that never parsed = malformed input, surface it.
+          // Empty stdin = "no input given", resolve undefined.
+          if (input.trim()) {
+            rejectWith(new Error(`Malformed JSON at stdin EOF: ${input.slice(0, 100)}...`));
+          } else {
+            resolveWith(undefined);
           }
         }
-      });
+      }
+    };
 
-      process.stdin.on('error', () => {
-        if (!resolved) {
-          // Don't reject on stdin errors - just return undefined
-          // This is more graceful for hook execution
-          resolveWith(undefined);
-        }
-      });
-    } catch {
+    const onError = () => {
+      if (!resolved) {
+        // Don't reject on stdin errors - just return undefined
+        // This is more graceful for hook execution
+        resolveWith(undefined);
+      }
+    };
+
+    try {
+      process.stdin.on('data', onData);
+      process.stdin.on('end', onEnd);
+      process.stdin.on('error', onError);
+    } catch (error) {
       // If attaching listeners fails (Bun stdin issue), resolve with undefined
+      logger.debug('HOOK', 'Failed to attach stdin listeners', { error: error instanceof Error ? error.message : String(error) });
       resolved = true;
       clearTimeout(safetyTimeoutId);
       cleanup();

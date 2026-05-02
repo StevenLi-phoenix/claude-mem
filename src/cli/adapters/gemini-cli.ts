@@ -1,19 +1,19 @@
 import type { PlatformAdapter } from '../types.js';
+import { AdapterRejectedInput, isValidCwd } from './errors.js';
 
 /**
  * Gemini CLI Platform Adapter
  *
  * Normalizes Gemini CLI's hook JSON to NormalizedHookInput.
- * Gemini CLI supports 11 lifecycle hooks; we register 8:
+ * Gemini CLI supports 11 lifecycle hooks; we register 7:
  *
  * Lifecycle:
  *   SessionStart  → context     (inject memory context)
- *   SessionEnd    → session-complete
  *   PreCompress   → summarize
  *   Notification  → observation (system events like ToolPermission)
  *
  * Agent:
- *   BeforeAgent   → user-message (captures user prompt)
+ *   BeforeAgent   → session-init (initializes session, captures user prompt)
  *   AfterAgent    → observation  (full agent response)
  *
  * Tool:
@@ -27,7 +27,7 @@ import type { PlatformAdapter } from '../types.js';
  * Base fields (all events): session_id, transcript_path, cwd, hook_event_name, timestamp
  *
  * Output format: { continue, stopReason, suppressOutput, systemMessage, decision, reason, hookSpecificOutput }
- * Advisory hooks (SessionStart, SessionEnd, PreCompress, Notification) ignore flow-control fields.
+ * Advisory hooks (SessionStart, PreCompress, Notification) ignore flow-control fields.
  */
 export const geminiCliAdapter: PlatformAdapter = {
   normalizeInput(raw) {
@@ -39,6 +39,10 @@ export const geminiCliAdapter: PlatformAdapter = {
       ?? process.env.GEMINI_PROJECT_DIR
       ?? process.env.CLAUDE_PROJECT_DIR
       ?? process.cwd();
+    // Plan 05 Phase 6 — cwd validation at the adapter boundary.
+    if (!isValidCwd(cwd)) {
+      throw new AdapterRejectedInput('invalid_cwd');
+    }
 
     const sessionId = r.session_id
       ?? process.env.GEMINI_SESSION_ID

@@ -59,94 +59,84 @@ export class ChromaSearchStrategy extends BaseSearchStrategy implements SearchSt
     const searchSessions = searchType === 'all' || searchType === 'sessions';
     const searchPrompts = searchType === 'all' || searchType === 'prompts';
 
+    // Build Chroma where filter for doc_type and project
+    const whereFilter = this.buildWhereFilter(searchType, project);
+
+    logger.debug('SEARCH', 'ChromaSearchStrategy: Querying Chroma', { query, searchType });
+
+    // Fail-fast: errors propagate to orchestrator, which translates to HTTP 503.
+    return await this.executeChromaSearch(query, whereFilter, {
+      searchObservations, searchSessions, searchPrompts,
+      obsType, concepts, files, orderBy, limit, project
+    });
+  }
+
+  private async executeChromaSearch(
+    query: string,
+    whereFilter: Record<string, any> | undefined,
+    options: {
+      searchObservations: boolean;
+      searchSessions: boolean;
+      searchPrompts: boolean;
+      obsType?: string | string[];
+      concepts?: string | string[];
+      files?: string | string[];
+      orderBy: 'relevance' | 'date_desc' | 'date_asc';
+      limit: number;
+      project?: string;
+    }
+  ): Promise<StrategySearchResult> {
+    const chromaResults = await this.chromaSync.queryChroma(
+      query,
+      SEARCH_CONSTANTS.CHROMA_BATCH_SIZE,
+      whereFilter
+    );
+
+    if (chromaResults.ids.length === 0) {
+      return {
+        results: { observations: [], sessions: [], prompts: [] },
+        usedChroma: true,
+        strategy: 'chroma'
+      };
+    }
+
+    const recentItems = this.filterByRecency(chromaResults);
+    const categorized = this.categorizeByDocType(recentItems, options);
+
     let observations: ObservationSearchResult[] = [];
     let sessions: SessionSummarySearchResult[] = [];
     let prompts: UserPromptSearchResult[] = [];
 
-    try {
-      // Build Chroma where filter for doc_type and project
-      const whereFilter = this.buildWhereFilter(searchType, project);
+    // Pass orderBy through unchanged. SessionStore's getObservationsByIds /
+    // getSessionSummariesByIds / getUserPromptsByIds accept 'relevance' as a
+    // valid value: they skip ORDER BY and preserve the caller-provided ID
+    // order (Chroma's vector similarity ranking). Coercing 'relevance' to
+    // undefined here would let SessionStore default to 'date_desc' and
+    // destroy the semantic ranking. See #2153.
+    const sqlOrderBy = options.orderBy;
 
-      // Step 1: Chroma semantic search
-      logger.debug('SEARCH', 'ChromaSearchStrategy: Querying Chroma', { query, searchType });
-      const chromaResults = await this.chromaSync.queryChroma(
-        query,
-        SEARCH_CONSTANTS.CHROMA_BATCH_SIZE,
-        whereFilter
-      );
-
-      logger.debug('SEARCH', 'ChromaSearchStrategy: Chroma returned matches', {
-        matchCount: chromaResults.ids.length
-      });
-
-      if (chromaResults.ids.length === 0) {
-        // No matches - this is the correct answer
-        return {
-          results: { observations: [], sessions: [], prompts: [] },
-          usedChroma: true,
-          fellBack: false,
-          strategy: 'chroma'
-        };
-      }
-
-      // Step 2: Filter by recency (90 days)
-      const recentItems = this.filterByRecency(chromaResults);
-      logger.debug('SEARCH', 'ChromaSearchStrategy: Filtered by recency', {
-        count: recentItems.length
-      });
-
-      // Step 3: Categorize by document type
-      const categorized = this.categorizeByDocType(recentItems, {
-        searchObservations,
-        searchSessions,
-        searchPrompts
-      });
-
-      // Step 4: Hydrate from SQLite with additional filters
-      if (categorized.obsIds.length > 0) {
-        const obsOptions = { type: obsType, concepts, files, orderBy, limit, project };
-        observations = this.sessionStore.getObservationsByIds(categorized.obsIds, obsOptions);
-      }
-
-      if (categorized.sessionIds.length > 0) {
-        sessions = this.sessionStore.getSessionSummariesByIds(categorized.sessionIds, {
-          orderBy,
-          limit,
-          project
-        });
-      }
-
-      if (categorized.promptIds.length > 0) {
-        prompts = this.sessionStore.getUserPromptsByIds(categorized.promptIds, {
-          orderBy,
-          limit,
-          project
-        });
-      }
-
-      logger.debug('SEARCH', 'ChromaSearchStrategy: Hydrated results', {
-        observations: observations.length,
-        sessions: sessions.length,
-        prompts: prompts.length
-      });
-
-      return {
-        results: { observations, sessions, prompts },
-        usedChroma: true,
-        fellBack: false,
-        strategy: 'chroma'
-      };
-
-    } catch (error) {
-      logger.error('SEARCH', 'ChromaSearchStrategy: Search failed', {}, error as Error);
-      // Return empty result - caller may try fallback strategy
-      return {
-        results: { observations: [], sessions: [], prompts: [] },
-        usedChroma: false,
-        fellBack: false,
-        strategy: 'chroma'
-      };
+    if (categorized.obsIds.length > 0) {
+      const obsOptions = { type: options.obsType, concepts: options.concepts, files: options.files, orderBy: sqlOrderBy, limit: options.limit, project: options.project };
+      observations = this.sessionStore.getObservationsByIds(categorized.obsIds, obsOptions);
     }
+
+    if (categorized.sessionIds.length > 0) {
+      sessions = this.sessionStore.getSessionSummariesByIds(categorized.sessionIds, {
+        orderBy: sqlOrderBy, limit: options.limit, project: options.project
+      });
+    }
+
+    if (categorized.promptIds.length > 0) {
+      prompts = this.sessionStore.getUserPromptsByIds(categorized.promptIds, {
+        orderBy: sqlOrderBy, limit: options.limit, project: options.project
+      });
+    }
+
+    return {
+      results: { observations, sessions, prompts },
+      usedChroma: true,
+      strategy: 'chroma'
+    };
   }
 
   /**

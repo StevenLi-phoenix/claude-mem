@@ -10,7 +10,7 @@
  */
 
 import path from 'path';
-import { existsSync, readFileSync, writeFileSync, unlinkSync, statSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { getWorkerPort, getWorkerHost } from '../shared/worker-utils.js';
@@ -24,43 +24,12 @@ import { addToExcluded, removeFromExcluded } from '../utils/repo-exclude-utils.j
 import { configureSupervisorSignalHandlers, getSupervisor, startSupervisor } from '../supervisor/index.js';
 import { sanitizeEnv } from '../supervisor/env-sanitizer.js';
 
-// Windows: avoid repeated spawn popups when startup fails (issue #921)
-const WINDOWS_SPAWN_COOLDOWN_MS = 2 * 60 * 1000;
-
-function getWorkerSpawnLockPath(): string {
-  return path.join(SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'), '.worker-start-attempted');
-}
-
-function shouldSkipSpawnOnWindows(): boolean {
-  if (process.platform !== 'win32') return false;
-  const lockPath = getWorkerSpawnLockPath();
-  if (!existsSync(lockPath)) return false;
-  try {
-    const modifiedTimeMs = statSync(lockPath).mtimeMs;
-    return Date.now() - modifiedTimeMs < WINDOWS_SPAWN_COOLDOWN_MS;
-  } catch {
-    return false;
-  }
-}
-
-function markWorkerSpawnAttempted(): void {
-  if (process.platform !== 'win32') return;
-  try {
-    writeFileSync(getWorkerSpawnLockPath(), '', 'utf-8');
-  } catch {
-    // Best-effort lock file — failure to write shouldn't block startup
-  }
-}
-
-function clearWorkerSpawnAttempted(): void {
-  if (process.platform !== 'win32') return;
-  try {
-    const lockPath = getWorkerSpawnLockPath();
-    if (existsSync(lockPath)) unlinkSync(lockPath);
-  } catch {
-    // Best-effort cleanup
-  }
-}
+// Worker spawn / Windows-cooldown helpers are defined in ./worker-spawner.ts
+// so that lightweight consumers (e.g. the MCP server running under Node) can
+// ensure the worker daemon is up without importing this entire module — which
+// transitively pulls in the SQLite database layer via ChromaSync/DatabaseManager.
+import { ensureWorkerStarted as ensureWorkerStartedShared } from './worker-spawner.js';
+import { RestartGuard } from './worker/RestartGuard.js';
 
 // Re-export for backward compatibility — canonical implementation in shared/plugin-state.ts
 export { isPluginDisabledInClaudeSettings } from '../shared/plugin-state.js';
@@ -76,23 +45,23 @@ import {
   readPidFile,
   removePidFile,
   getPlatformTimeout,
-  aggressiveStartupCleanup,
   runOneTimeChromaMigration,
+  runOneTimeCwdRemap,
   cleanStalePidFile,
-  isProcessAlive,
+  verifyPidFileOwnership,
   spawnDaemon,
-  isPidFileRecent,
   touchPidFile
 } from './infrastructure/ProcessManager.js';
+import { runOneTimeV12_4_3Cleanup } from './infrastructure/CleanupV12_4_3.js';
 import {
   isPortInUse,
   waitForHealth,
   waitForReadiness,
   waitForPortFree,
-  httpShutdown,
-  checkVersionMatch
+  httpShutdown
 } from './infrastructure/HealthMonitor.js';
 import { performGracefulShutdown } from './infrastructure/GracefulShutdown.js';
+import { adoptMergedWorktrees, adoptMergedWorktreesForAllKnownRepos } from './infrastructure/WorktreeAdoption.js';
 
 // Server imports
 import { Server } from './server/Server.js';
@@ -111,6 +80,7 @@ import { DatabaseManager } from './worker/DatabaseManager.js';
 import { SessionManager } from './worker/SessionManager.js';
 import { SSEBroadcaster } from './worker/SSEBroadcaster.js';
 import { SDKAgent } from './worker/SDKAgent.js';
+import type { WorkerRef } from './worker/agents/types.js';
 import { GeminiAgent, isGeminiSelected, isGeminiAvailable } from './worker/GeminiAgent.js';
 import { OpenRouterAgent, isOpenRouterSelected, isOpenRouterAvailable } from './worker/OpenRouterAgent.js';
 import { PaginationHelper } from './worker/PaginationHelper.js';
@@ -119,6 +89,10 @@ import { SearchManager } from './worker/SearchManager.js';
 import { FormattingService } from './worker/FormattingService.js';
 import { TimelineService } from './worker/TimelineService.js';
 import { SessionEventBroadcaster } from './worker/events/SessionEventBroadcaster.js';
+import { SessionCompletionHandler } from './worker/session/SessionCompletionHandler.js';
+import { setIngestContext, attachIngestGeneratorStarter } from './worker/http/shared.js';
+import { DEFAULT_CONFIG_PATH, DEFAULT_STATE_PATH, expandHomePath, loadTranscriptWatchConfig, writeSampleConfig } from './transcripts/config.js';
+import { TranscriptWatcher } from './transcripts/watcher.js';
 
 // HTTP route handlers
 import { ViewerRoutes } from './worker/http/routes/ViewerRoutes.js';
@@ -128,13 +102,19 @@ import { SearchRoutes } from './worker/http/routes/SearchRoutes.js';
 import { SettingsRoutes } from './worker/http/routes/SettingsRoutes.js';
 import { LogsRoutes } from './worker/http/routes/LogsRoutes.js';
 import { MemoryRoutes } from './worker/http/routes/MemoryRoutes.js';
+import { CorpusRoutes } from './worker/http/routes/CorpusRoutes.js';
+import { ChromaRoutes } from './worker/http/routes/ChromaRoutes.js';
 
-// Process management for zombie cleanup (Issue #737)
-import { startOrphanReaper, reapOrphanedProcesses, getProcessBySession, ensureProcessExit } from './worker/ProcessRegistry.js';
+// Knowledge agent services
+import { CorpusStore } from './worker/knowledge/CorpusStore.js';
+import { CorpusBuilder } from './worker/knowledge/CorpusBuilder.js';
+import { KnowledgeAgent } from './worker/knowledge/KnowledgeAgent.js';
 
-// Transcript watcher for external CLI session monitoring
-import { TranscriptWatcher } from './transcripts/watcher.js';
-import { loadTranscriptWatchConfig, expandHomePath, DEFAULT_CONFIG_PATH as TRANSCRIPT_CONFIG_PATH } from './transcripts/config.js';
+// Primary-path session lifecycle helpers — no reapers, no orphan sweeps.
+// The SDK subprocess is spawned in its own POSIX process group via
+// createSdkSpawnFactory; teardown via ensureSdkProcessExit kills the whole
+// group so no descendants leak (Principle 5).
+import { getSdkProcessForSession, ensureSdkProcessExit } from '../supervisor/process-registry.js';
 
 /**
  * Build JSON status output for hook framework communication.
@@ -160,7 +140,7 @@ export function buildStatusOutput(status: 'ready' | 'error', message?: string): 
   };
 }
 
-export class WorkerService {
+export class WorkerService implements WorkerRef {
   private server: Server;
   private startTime: number = Date.now();
   private mcpClient: Client;
@@ -173,13 +153,15 @@ export class WorkerService {
   // Service layer
   private dbManager: DatabaseManager;
   private sessionManager: SessionManager;
-  private sseBroadcaster: SSEBroadcaster;
+  public sseBroadcaster: SSEBroadcaster;
   private sdkAgent: SDKAgent;
   private geminiAgent: GeminiAgent;
   private openRouterAgent: OpenRouterAgent;
   private paginationHelper: PaginationHelper;
   private settingsManager: SettingsManager;
   private sessionEventBroadcaster: SessionEventBroadcaster;
+  private completionHandler: SessionCompletionHandler;
+  private corpusStore: CorpusStore;
 
   // Route handlers
   private searchRoutes: SearchRoutes | null = null;
@@ -187,18 +169,12 @@ export class WorkerService {
   // Chroma MCP manager (lazy - connects on first use)
   private chromaMcpManager: ChromaMcpManager | null = null;
 
+  // Transcript watcher for Codex and other transcript-based clients
+  private transcriptWatcher: TranscriptWatcher | null = null;
+
   // Initialization tracking
   private initializationComplete: Promise<void>;
   private resolveInitialization!: () => void;
-
-  // Orphan reaper cleanup function (Issue #737)
-  private stopOrphanReaper: (() => void) | null = null;
-
-  // Stale session reaper interval (Issue #1168)
-  private staleSessionReaperInterval: ReturnType<typeof setInterval> | null = null;
-
-  // Transcript watcher for external CLI sessions (e.g. Codex, Gemini)
-  private transcriptWatcher: TranscriptWatcher | null = null;
 
   // AI interaction tracking for health endpoint
   private lastAiInteraction: {
@@ -225,6 +201,20 @@ export class WorkerService {
     this.paginationHelper = new PaginationHelper(this.dbManager);
     this.settingsManager = new SettingsManager(this.dbManager);
     this.sessionEventBroadcaster = new SessionEventBroadcaster(this.sseBroadcaster, this);
+    this.completionHandler = new SessionCompletionHandler(
+      this.sessionManager,
+      this.sessionEventBroadcaster,
+      this.dbManager,
+    );
+    this.corpusStore = new CorpusStore();
+
+    // Wire ingest helpers (plan 03 phase 0). Worker-internal callers use these
+    // directly instead of HTTP-loopback into our own routes.
+    setIngestContext({
+      sessionManager: this.sessionManager,
+      dbManager: this.dbManager,
+      eventBroadcaster: this.sessionEventBroadcaster,
+    });
 
     // Set callback for when sessions are deleted
     this.sessionManager.setOnSessionDeleted(() => {
@@ -287,6 +277,9 @@ export class WorkerService {
   private registerRoutes(): void {
     // IMPORTANT: Middleware must be registered BEFORE routes (Express processes in order)
 
+    // Register Chroma routes immediately so they bypass the initialization guard
+    this.server.registerRoutes(new ChromaRoutes());
+
     // Early handler for /api/context/inject — fail open if not yet initialized
     this.server.app.get('/api/context/inject', async (req, res, next) => {
       if (!this.initializationCompleteFlag || !this.searchRoutes) {
@@ -300,14 +293,20 @@ export class WorkerService {
 
     // Guard ALL /api/* routes during initialization — wait for DB with timeout
     // Exceptions: /api/health, /api/readiness, /api/version (handled by Server.ts core routes)
-    // and /api/context/inject (handled above with fail-open)
+    // and /api/chroma/status (diagnostic endpoint)
     this.server.app.use('/api', async (req, res, next) => {
+      // Bypass guard for diagnostic endpoints
+      if (req.path === '/chroma/status' || req.path === '/health' || req.path === '/readiness' || req.path === '/version') {
+        next();
+        return;
+      }
+
       if (this.initializationCompleteFlag) {
         next();
         return;
       }
 
-      const timeoutMs = 30000;
+      const timeoutMs = 120000; // 2 minutes
       const timeoutPromise = new Promise<void>((_, reject) =>
         setTimeout(() => reject(new Error('Database initialization timeout')), timeoutMs)
       );
@@ -316,17 +315,30 @@ export class WorkerService {
         await Promise.race([this.initializationComplete, timeoutPromise]);
         next();
       } catch (error) {
-        logger.error('HTTP', `Request to ${req.method} ${req.path} rejected — DB not initialized`, {}, error as Error);
+        if (error instanceof Error) {
+          logger.error('WORKER', `Request to ${req.method} ${req.path} rejected — DB not initialized`, {}, error);
+        } else {
+          logger.error('WORKER', `Request to ${req.method} ${req.path} rejected — DB not initialized with non-Error`, {}, new Error(String(error)));
+        }
         res.status(503).json({
           error: 'Service initializing',
           message: 'Database is still initializing, please retry'
         });
+        return;
       }
     });
 
     // Standard routes (registered AFTER guard middleware)
     this.server.registerRoutes(new ViewerRoutes(this.sseBroadcaster, this.dbManager, this.sessionManager));
-    this.server.registerRoutes(new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this));
+    const sessionRoutes = new SessionRoutes(this.sessionManager, this.dbManager, this.sdkAgent, this.geminiAgent, this.openRouterAgent, this.sessionEventBroadcaster, this, this.completionHandler);
+    this.server.registerRoutes(sessionRoutes);
+    // Wire the generator-starter callback now that SessionRoutes exists.
+    // `setIngestContext` ran in the constructor before routes were
+    // constructed; transcript-watcher observations depend on this side-effect
+    // to auto-start the SDK generator after enqueue.
+    attachIngestGeneratorStarter((sessionDbId, source) =>
+      sessionRoutes.ensureGeneratorRunning(sessionDbId, source),
+    );
     this.server.registerRoutes(new DataRoutes(this.paginationHelper, this.dbManager, this.sessionManager, this.sseBroadcaster, this, this.startTime));
     this.server.registerRoutes(new SettingsRoutes(this.settingsManager));
     this.server.registerRoutes(new LogsRoutes());
@@ -373,7 +385,7 @@ export class WorkerService {
    */
   private async initializeBackground(): Promise<void> {
     try {
-      await aggressiveStartupCleanup();
+      logger.info('WORKER', 'Background initialization starting...');
 
       // Load mode configuration
       const { ModeManager } = await import('./domain/ModeManager.js');
@@ -382,11 +394,39 @@ export class WorkerService {
 
       const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
 
+      const modeId = settings.CLAUDE_MEM_MODE;
+      ModeManager.getInstance().loadMode(modeId);
+      logger.info('SYSTEM', `Mode loaded: ${modeId}`);
+
       // One-time chroma wipe for users upgrading from versions with duplicate worker bugs.
-      // Only runs in local mode (chroma is local-only). Backfill at line ~414 rebuilds from SQLite.
       if (settings.CLAUDE_MEM_MODE === 'local' || !settings.CLAUDE_MEM_MODE) {
+        logger.info('WORKER', 'Checking for one-time Chroma migration...');
         runOneTimeChromaMigration();
       }
+
+      // One-time remap of pre-worktree project names using pending_messages.cwd.
+      logger.info('WORKER', 'Checking for one-time CWD remap...');
+      runOneTimeCwdRemap();
+
+      // Stamp merged worktrees (Non-blocking, fire-and-forget)
+      logger.info('WORKER', 'Adopting merged worktrees (background)...');
+      adoptMergedWorktreesForAllKnownRepos({}).then(adoptions => {
+        if (adoptions) {
+          for (const adoption of adoptions) {
+            if (adoption.adoptedObservations > 0 || adoption.adoptedSummaries > 0 || adoption.chromaUpdates > 0) {
+              logger.info('SYSTEM', 'Merged worktrees adopted in background', adoption);
+            }
+            if (adoption.errors.length > 0) {
+              logger.warn('SYSTEM', 'Worktree adoption had per-branch errors', {
+                repoPath: adoption.repoPath,
+                errors: adoption.errors
+              });
+            }
+          }
+        }
+      }).catch(err => {
+        logger.error('WORKER', 'Worktree adoption failed (background)', {}, err instanceof Error ? err : new Error(String(err)));
+      });
 
       // Initialize ChromaMcpManager only if Chroma is enabled
       const chromaEnabled = settings.CLAUDE_MEM_CHROMA_ENABLED !== 'false';
@@ -397,21 +437,28 @@ export class WorkerService {
         logger.info('SYSTEM', 'Chroma disabled via CLAUDE_MEM_CHROMA_ENABLED=false, skipping ChromaMcpManager');
       }
 
-      const modeId = settings.CLAUDE_MEM_MODE;
-      ModeManager.getInstance().loadMode(modeId);
-      logger.info('SYSTEM', `Mode loaded: ${modeId}`);
-
+      logger.info('WORKER', 'Initializing database manager...');
       await this.dbManager.initialize();
 
-      // Reset any messages that were processing when worker died
-      const { PendingMessageStore } = await import('./sqlite/PendingMessageStore.js');
-      const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
-      const resetCount = pendingStore.resetStaleProcessingMessages(0); // 0 = reset ALL processing
-      if (resetCount > 0) {
-        logger.info('SYSTEM', `Reset ${resetCount} stale processing messages to pending`);
+      // One-shot GC for terminally-failed rows
+      try {
+        logger.info('WORKER', 'Running startup GC for pending messages...');
+        const { PendingMessageStore } = await import('./sqlite/PendingMessageStore.js');
+        const pendingStore = new PendingMessageStore(this.dbManager.getSessionStore().db, 3);
+        const cleared = pendingStore.clearFailedOlderThan(7 * 24 * 60 * 60 * 1000);
+        if (cleared > 0) {
+          logger.info('QUEUE', 'Startup GC cleared old failed pending_messages rows', { cleared });
+        }
+      } catch (err) {
+        logger.warn('QUEUE', 'Startup GC for failed pending_messages rows failed', {}, err instanceof Error ? err : undefined);
       }
 
+      // One-time v12.4.3 pollution cleanup. Runs AFTER migrations have applied
+      // and BEFORE backfillAllProjects so the rebuilt Chroma sees a clean SQLite.
+      runOneTimeV12_4_3Cleanup();
+
       // Initialize search services
+      logger.info('WORKER', 'Initializing search services...');
       const formattingService = new FormattingService();
       const timelineService = new TimelineService();
       const searchManager = new SearchManager(
@@ -425,125 +472,140 @@ export class WorkerService {
       this.server.registerRoutes(this.searchRoutes);
       logger.info('WORKER', 'SearchManager initialized and search routes registered');
 
+      // Register corpus routes (knowledge agents) — needs SearchOrchestrator from search module
+      const { SearchOrchestrator } = await import('./worker/search/SearchOrchestrator.js');
+      const corpusSearchOrchestrator = new SearchOrchestrator(
+        this.dbManager.getSessionSearch(),
+        this.dbManager.getSessionStore(),
+        this.dbManager.getChromaSync()
+      );
+      const corpusBuilder = new CorpusBuilder(
+        this.dbManager.getSessionStore(),
+        corpusSearchOrchestrator,
+        this.corpusStore
+      );
+      const knowledgeAgent = new KnowledgeAgent(this.corpusStore);
+      this.server.registerRoutes(new CorpusRoutes(this.corpusStore, corpusBuilder, knowledgeAgent));
+      logger.info('WORKER', 'CorpusRoutes registered');
+
       // DB and search are ready — mark initialization complete so hooks can proceed.
-      // MCP connection is tracked separately via mcpReady and is NOT required for
-      // the worker to serve context/search requests.
       this.initializationCompleteFlag = true;
       this.resolveInitialization();
       logger.info('SYSTEM', 'Core initialization complete (DB + search ready)');
 
-      // Auto-start transcript watchers if configured
-      if (existsSync(TRANSCRIPT_CONFIG_PATH)) {
-        try {
-          const transcriptConfig = loadTranscriptWatchConfig(TRANSCRIPT_CONFIG_PATH);
-          if (transcriptConfig.watches.length > 0) {
-            const transcriptStatePath = expandHomePath(transcriptConfig.stateFile ?? '~/.claude-mem/transcript-watch-state.json');
-            this.transcriptWatcher = new TranscriptWatcher(transcriptConfig, transcriptStatePath);
-            await this.transcriptWatcher.start();
-            logger.info('SYSTEM', `Transcript watcher started with ${transcriptConfig.watches.length} watch target(s)`);
-          }
-        } catch (transcriptError) {
-          logger.warn('SYSTEM', 'Failed to start transcript watcher (non-fatal)', {}, transcriptError as Error);
-          // Non-fatal — worker continues without transcript watching
-        }
-      }
+      await this.startTranscriptWatcher(settings);
 
       // Auto-backfill Chroma for all projects if out of sync with SQLite (fire-and-forget)
       if (this.chromaMcpManager) {
-        ChromaSync.backfillAllProjects().then(() => {
+        ChromaSync.backfillAllProjects(this.dbManager.getSessionStore()).then(() => {
           logger.info('CHROMA_SYNC', 'Backfill check complete for all projects');
         }).catch(error => {
           logger.error('CHROMA_SYNC', 'Backfill failed (non-blocking)', {}, error as Error);
         });
       }
 
-      // Connect to MCP server
+      // Mark MCP as externally ready once the bundled stdio server binary exists.
       const mcpServerPath = path.join(__dirname, 'mcp-server.cjs');
-      getSupervisor().assertCanSpawn('mcp server');
-      const transport = new StdioClientTransport({
-        command: 'node',
-        args: [mcpServerPath],
-        env: sanitizeEnv(process.env)
+      this.mcpReady = existsSync(mcpServerPath);
+
+      // Best-effort loopback MCP self-check (Non-blocking, F&F)
+      this.runMcpSelfCheck(mcpServerPath).catch(err => {
+        logger.debug('WORKER', 'MCP self-check failed (non-fatal)', { error: err.message });
       });
 
-      const MCP_INIT_TIMEOUT_MS = 300000;
+      return;
+    } catch (error) {
+      // Background initialization failed - log and let worker fail health checks
+      logger.error('SYSTEM', 'Background initialization failed', {}, error instanceof Error ? error : undefined);
+    }
+  }
+
+  /**
+   * Run a best-effort loopback MCP self-check to verify the bundled server can start.
+   * This is entirely diagnostic and does not block worker availability.
+   */
+  private async runMcpSelfCheck(mcpServerPath: string): Promise<void> {
+    try {
+      getSupervisor().assertCanSpawn('mcp server');
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [mcpServerPath],
+        env: Object.fromEntries(
+          Object.entries(sanitizeEnv(process.env)).filter(([, value]) => value !== undefined)
+        ) as Record<string, string>
+      });
+
+      const MCP_INIT_TIMEOUT_MS = 60000; // 1 minute is plenty for local check
       const mcpConnectionPromise = this.mcpClient.connect(transport);
-      let timeoutId: ReturnType<typeof setTimeout>;
+      
       const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(
-          () => reject(new Error('MCP connection timeout after 5 minutes')),
-          MCP_INIT_TIMEOUT_MS
+        setTimeout(
+          () => reject(new Error('MCP connection timeout')),
+          60000
         );
       });
 
-      try {
-        await Promise.race([mcpConnectionPromise, timeoutPromise]);
-      } catch (connectionError) {
-        clearTimeout(timeoutId!);
-        logger.warn('WORKER', 'MCP server connection failed, cleaning up subprocess', {
-          error: connectionError instanceof Error ? connectionError.message : String(connectionError)
-        });
-        try {
-          await transport.close();
-        } catch {
-          // Best effort: the supervisor handles later process cleanup for survivors.
-        }
-        throw connectionError;
-      }
-      clearTimeout(timeoutId!);
+      await Promise.race([mcpConnectionPromise, timeoutPromise]);
+      logger.info('WORKER', 'MCP loopback self-check connected successfully');
 
-      const mcpProcess = (transport as unknown as { _process?: import('child_process').ChildProcess })._process;
-      if (mcpProcess?.pid) {
-        getSupervisor().registerProcess('mcp-server', {
-          pid: mcpProcess.pid,
-          type: 'mcp',
-          startedAt: new Date().toISOString()
-        }, mcpProcess);
-        mcpProcess.once('exit', () => {
-          getSupervisor().unregisterProcess('mcp-server');
-        });
-      }
-      this.mcpReady = true;
-      logger.success('WORKER', 'MCP server connected');
-
-      // Start orphan reaper to clean up zombie processes (Issue #737)
-      this.stopOrphanReaper = startOrphanReaper(() => {
-        const activeIds = new Set<number>();
-        for (const [id] of this.sessionManager['sessions']) {
-          activeIds.add(id);
-        }
-        return activeIds;
-      });
-      logger.info('SYSTEM', 'Started orphan reaper (runs every 30 seconds)');
-
-      // Reap stale sessions to unblock orphan process cleanup (Issue #1168)
-      this.staleSessionReaperInterval = setInterval(async () => {
-        try {
-          const reaped = await this.sessionManager.reapStaleSessions();
-          if (reaped > 0) {
-            logger.info('SYSTEM', `Reaped ${reaped} stale sessions`);
-          }
-        } catch (e) {
-          logger.error('SYSTEM', 'Stale session reaper error', { error: e instanceof Error ? e.message : String(e) });
-        }
-      }, 2 * 60 * 1000);
-
-      // Auto-recover orphaned queues (fire-and-forget with error logging)
-      this.processPendingQueues(50).then(result => {
-        if (result.sessionsStarted > 0) {
-          logger.info('SYSTEM', `Auto-recovered ${result.sessionsStarted} sessions with pending work`, {
-            totalPending: result.totalPendingSessions,
-            started: result.sessionsStarted,
-            sessionIds: result.startedSessionIds
-          });
-        }
-      }).catch(error => {
-        logger.error('SYSTEM', 'Auto-recovery of pending queues failed', {}, error as Error);
-      });
+      // Cleanup
+      await transport.close();
     } catch (error) {
-      logger.error('SYSTEM', 'Background initialization failed', {}, error as Error);
-      throw error;
+      logger.warn('WORKER', 'MCP loopback self-check failed', { 
+        error: error instanceof Error ? error.message : String(error) 
+      });
     }
+  }
+
+  /**
+   * Start transcript watcher for Codex and other transcript-based clients.
+   * This is intentionally non-fatal so Claude hooks remain usable even if
+   * transcript ingestion is misconfigured.
+   */
+  private async startTranscriptWatcher(settings: ReturnType<typeof SettingsDefaultsManager.loadFromFile>): Promise<void> {
+    const transcriptsEnabled = settings.CLAUDE_MEM_TRANSCRIPTS_ENABLED !== 'false';
+    if (!transcriptsEnabled) {
+      logger.info('TRANSCRIPT', 'Transcript watcher disabled via CLAUDE_MEM_TRANSCRIPTS_ENABLED=false');
+      return;
+    }
+
+    const configPath = settings.CLAUDE_MEM_TRANSCRIPTS_CONFIG_PATH || DEFAULT_CONFIG_PATH;
+    const resolvedConfigPath = expandHomePath(configPath);
+
+    // Ensure sample config exists (setup, outside try)
+    if (!existsSync(resolvedConfigPath)) {
+      writeSampleConfig(configPath);
+      logger.info('TRANSCRIPT', 'Created default transcript watch config', {
+        configPath: resolvedConfigPath
+      });
+    }
+
+    const transcriptConfig = loadTranscriptWatchConfig(configPath);
+    const statePath = expandHomePath(transcriptConfig.stateFile ?? DEFAULT_STATE_PATH);
+
+    try {
+      this.transcriptWatcher = new TranscriptWatcher(transcriptConfig, statePath);
+      await this.transcriptWatcher.start();
+    } catch (error) {
+      this.transcriptWatcher?.stop();
+      this.transcriptWatcher = null;
+      if (error instanceof Error) {
+        logger.error('WORKER', 'Failed to start transcript watcher (continuing without Codex ingestion)', {
+          configPath: resolvedConfigPath
+        }, error);
+      } else {
+        logger.error('WORKER', 'Failed to start transcript watcher with non-Error (continuing without Codex ingestion)', {
+          configPath: resolvedConfigPath
+        }, new Error(String(error)));
+      }
+      // [ANTI-PATTERN IGNORED]: Transcript watcher is intentionally non-fatal so Claude hooks remain usable even if transcript ingestion is misconfigured
+      return;
+    }
+    logger.info('TRANSCRIPT', 'Transcript watcher started', {
+      configPath: resolvedConfigPath,
+      statePath,
+      watches: transcriptConfig.watches.length
+    });
   }
 
   /**
@@ -641,7 +703,8 @@ export class WorkerService {
         }
 
         // Detect stale resume failures - SDK session context was lost
-        if ((errorMessage.includes('aborted by user') || errorMessage.includes('No conversation found'))
+        const staleResumePatterns = ['aborted by user', 'No conversation found'];
+        if (staleResumePatterns.some(p => errorMessage.includes(p))
             && session.memorySessionId) {
           logger.warn('SDK', 'Detected stale resume failure, clearing memorySessionId for fresh start', {
             sessionId: session.sessionDbId,
@@ -668,10 +731,11 @@ export class WorkerService {
         throw error;
       })
       .finally(async () => {
-        // CRITICAL: Verify subprocess exit to prevent zombie accumulation (Issue #1168)
-        const trackedProcess = getProcessBySession(session.sessionDbId);
+        // Primary-path subprocess teardown — process-group kill ensures any
+        // SDK descendants are reaped too (Principle 5).
+        const trackedProcess = getSdkProcessForSession(session.sessionDbId);
         if (trackedProcess && trackedProcess.process.exitCode === null) {
-          await ensureProcessExit(trackedProcess, 5000);
+          await ensureSdkProcessExit(trackedProcess, 5000);
         }
 
         session.generatorPromise = null;
@@ -707,17 +771,21 @@ export class WorkerService {
           }
           // Fall through to pending-work restart below
         }
-        const MAX_PENDING_RESTARTS = 3;
-
         if (pendingCount > 0) {
-          // Track consecutive pending-work restarts to prevent infinite loops (e.g. FK errors)
-          session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1;
+          // Windowed restart guard: only blocks tight-loop restarts, not spread-out ones (#2053)
+          if (!session.restartGuard) session.restartGuard = new RestartGuard();
+          const restartAllowed = session.restartGuard.recordRestart();
+          session.consecutiveRestarts = (session.consecutiveRestarts || 0) + 1; // Keep for logging
 
-          if (session.consecutiveRestarts > MAX_PENDING_RESTARTS) {
-            logger.error('SYSTEM', 'Exceeded max pending-work restarts, stopping to prevent infinite loop', {
+          if (!restartAllowed) {
+            logger.error('SYSTEM', 'Restart guard tripped: session is dead, terminating', {
               sessionId: session.sessionDbId,
               pendingCount,
-              consecutiveRestarts: session.consecutiveRestarts
+              restartsInWindow: session.restartGuard.restartsInWindow,
+              windowMs: session.restartGuard.windowMs,
+              maxRestarts: session.restartGuard.maxRestarts,
+              consecutiveFailures: session.restartGuard.consecutiveFailuresSinceSuccess,
+              maxConsecutiveFailures: session.restartGuard.maxConsecutiveFailures
             });
             session.consecutiveRestarts = 0;
             this.terminateSession(session.sessionDbId, 'max_restarts_exceeded');
@@ -735,9 +803,13 @@ export class WorkerService {
           this.startSessionProcessor(session, 'pending-work-restart');
           this.broadcastProcessingStatus();
         } else {
-          // Successful completion with no pending work — clean up session
-          // removeSessionImmediate fires onSessionDeletedCallback → broadcastProcessingStatus()
+          // Successful completion with no pending work — finalize then drop
+          // in-memory state. finalizeSession flips sdk_sessions.status to
+          // 'completed', drains orphaned pendings, broadcasts. This is the
+          // sole completion path now that the SessionEnd hook shim is gone.
+          session.restartGuard?.recordSuccess();
           session.consecutiveRestarts = 0;
+          this.completionHandler.finalizeSession(session.sessionDbId);
           this.sessionManager.removeSessionImmediate(session.sessionDbId);
         }
       });
@@ -746,16 +818,30 @@ export class WorkerService {
   /**
    * Match errors that indicate the Claude Code process/session is gone (resume impossible).
    * Used to trigger graceful fallback instead of leaving pending messages stuck forever.
+   *
+   * These patterns come from the Claude SDK's ProcessTransport and related internals.
+   * The SDK does not export typed error classes, so string matching on normalized
+   * messages is the only reliable detection method. Each pattern corresponds to a
+   * specific SDK failure mode:
+   *   - 'process aborted by user': user cancelled the Claude Code session
+   *   - 'processtransport': transport layer disconnected
+   *   - 'not ready for writing': stdio pipe to Claude process is closed
+   *   - 'session generator failed': wrapper error from our own agent layer
+   *   - 'claude code process': process exited or was killed
    */
+  private static readonly SESSION_TERMINATED_PATTERNS = [
+    'process aborted by user',
+    'processtransport',
+    'not ready for writing',
+    'session generator failed',
+    'claude code process',
+  ] as const;
+
   private isSessionTerminatedError(error: unknown): boolean {
     const msg = error instanceof Error ? error.message : String(error);
     const normalized = msg.toLowerCase();
-    return (
-      normalized.includes('process aborted by user') ||
-      normalized.includes('processtransport') ||
-      normalized.includes('not ready for writing') ||
-      normalized.includes('session generator failed') ||
-      normalized.includes('claude code process')
+    return WorkerService.SESSION_TERMINATED_PATTERNS.some(
+      pattern => normalized.includes(pattern)
     );
   }
 
@@ -783,10 +869,15 @@ export class WorkerService {
         await this.geminiAgent.startSession(session, this);
         return;
       } catch (e) {
-        logger.warn('SDK', 'Fallback Gemini failed, trying OpenRouter', {
-          sessionId: sessionDbId,
-          error: e instanceof Error ? e.message : String(e)
-        });
+        // [ANTI-PATTERN IGNORED]: Fallback chain by design — Gemini failure falls through to OpenRouter attempt
+        if (e instanceof Error) {
+          logger.warn('WORKER', 'Fallback Gemini failed, trying OpenRouter', {
+            sessionId: sessionDbId,
+          });
+          logger.error('WORKER', 'Gemini fallback error detail', { sessionId: sessionDbId }, e);
+        } else {
+          logger.error('WORKER', 'Gemini fallback failed with non-Error', { sessionId: sessionDbId }, new Error(String(e)));
+        }
       }
     }
 
@@ -795,24 +886,21 @@ export class WorkerService {
         await this.openRouterAgent.startSession(session, this);
         return;
       } catch (e) {
-        logger.warn('SDK', 'Fallback OpenRouter failed', {
-          sessionId: sessionDbId,
-          error: e instanceof Error ? e.message : String(e)
-        });
+        // [ANTI-PATTERN IGNORED]: Last fallback in chain — failure falls through to message abandonment, which is the designed terminal behavior
+        if (e instanceof Error) {
+          logger.error('WORKER', 'Fallback OpenRouter failed, will abandon messages', { sessionId: sessionDbId }, e);
+        } else {
+          logger.error('WORKER', 'Fallback OpenRouter failed with non-Error, will abandon messages', { sessionId: sessionDbId }, new Error(String(e)));
+        }
       }
     }
 
-    // No fallback or both failed: mark messages abandoned and remove session so queue doesn't grow
-    const pendingStore = this.sessionManager.getPendingMessageStore();
-    const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
-    if (abandoned > 0) {
-      logger.warn('SDK', 'No fallback available; marked pending messages abandoned', {
-        sessionId: sessionDbId,
-        abandoned
-      });
-    }
+    // No fallback or both failed: mark session completed in DB (drain pending
+    // + broadcast via finalizeSession, idempotent) then drop in-memory state.
+    // Without this, sdk_sessions.status stays 'active' forever — the deleted
+    // reapStaleSessions interval was the only prior backstop.
+    this.completionHandler.finalizeSession(sessionDbId);
     this.sessionManager.removeSessionImmediate(sessionDbId);
-    this.sessionEventBroadcaster.broadcastSessionCompleted(sessionDbId);
   }
 
   /**
@@ -826,14 +914,12 @@ export class WorkerService {
    *                    no?  → terminateSession()
    */
   private terminateSession(sessionDbId: number, reason: string): void {
-    const pendingStore = this.sessionManager.getPendingMessageStore();
-    const abandoned = pendingStore.markAllSessionMessagesAbandoned(sessionDbId);
+    logger.info('SYSTEM', 'Session terminated', { sessionId: sessionDbId, reason });
 
-    logger.info('SYSTEM', 'Session terminated', {
-      sessionId: sessionDbId,
-      reason,
-      abandonedMessages: abandoned
-    });
+    // finalizeSession marks sdk_sessions.status='completed', drains pending
+    // messages, and broadcasts. Idempotent. Without this, wall-clock-limited
+    // and unrecoverable-error paths leave DB rows as 'active' forever.
+    this.completionHandler.finalizeSession(sessionDbId);
 
     // removeSessionImmediate fires onSessionDeletedCallback → broadcastProcessingStatus()
     this.sessionManager.removeSessionImmediate(sessionDbId);
@@ -857,37 +943,50 @@ export class WorkerService {
     const STALE_SESSION_THRESHOLD_MS = 6 * 60 * 60 * 1000;
     const staleThreshold = Date.now() - STALE_SESSION_THRESHOLD_MS;
 
-    try {
-      const staleSessionIds = sessionStore.db.prepare(`
-        SELECT id FROM sdk_sessions
-        WHERE status = 'active' AND started_at_epoch < ?
-      `).all(staleThreshold) as { id: number }[];
+    const staleSessionIds = sessionStore.db.prepare(`
+      SELECT id FROM sdk_sessions
+      WHERE status = 'active' AND started_at_epoch < ?
+    `).all(staleThreshold) as { id: number }[];
 
-      if (staleSessionIds.length > 0) {
-        const ids = staleSessionIds.map(r => r.id);
-        const placeholders = ids.map(() => '?').join(',');
+    if (staleSessionIds.length > 0) {
+      const ids = staleSessionIds.map(r => r.id);
+      const placeholders = ids.map(() => '?').join(',');
+      const now = Date.now();
 
+      try {
         sessionStore.db.prepare(`
           UPDATE sdk_sessions
           SET status = 'failed', completed_at_epoch = ?
           WHERE id IN (${placeholders})
-        `).run(Date.now(), ...ids);
-
+        `).run(now, ...ids);
         logger.info('SYSTEM', `Marked ${ids.length} stale sessions as failed`);
+      } catch (error) {
+        // [ANTI-PATTERN IGNORED]: Stale session cleanup is best-effort; pending queue processing below must still proceed
+        if (error instanceof Error) {
+          logger.error('WORKER', 'Failed to mark stale sessions as failed', { staleCount: ids.length }, error);
+        } else {
+          logger.error('WORKER', 'Failed to mark stale sessions as failed with non-Error', { staleCount: ids.length }, new Error(String(error)));
+        }
+      }
 
+      try {
         const msgResult = sessionStore.db.prepare(`
           UPDATE pending_messages
           SET status = 'failed', failed_at_epoch = ?
           WHERE status = 'pending'
           AND session_db_id IN (${placeholders})
-        `).run(Date.now(), ...ids);
-
+        `).run(now, ...ids);
         if (msgResult.changes > 0) {
           logger.info('SYSTEM', `Marked ${msgResult.changes} pending messages from stale sessions as failed`);
         }
+      } catch (error) {
+        // [ANTI-PATTERN IGNORED]: Pending message cleanup is best-effort; queue processing below must still proceed
+        if (error instanceof Error) {
+          logger.error('WORKER', 'Failed to clean up stale pending messages', { staleCount: ids.length }, error);
+        } else {
+          logger.error('WORKER', 'Failed to clean up stale pending messages with non-Error', { staleCount: ids.length }, new Error(String(error)));
+        }
       }
-    } catch (error) {
-      logger.error('SYSTEM', 'Failed to clean up stale sessions', {}, error as Error);
     }
 
     const orphanedSessionIds = pendingStore.getSessionsWithPendingMessages();
@@ -906,28 +1005,34 @@ export class WorkerService {
     for (const sessionDbId of orphanedSessionIds) {
       if (result.sessionsStarted >= sessionLimit) break;
 
+      const existingSession = this.sessionManager.getSession(sessionDbId);
+      if (existingSession?.generatorPromise) {
+        result.sessionsSkipped++;
+        continue;
+      }
+
       try {
-        const existingSession = this.sessionManager.getSession(sessionDbId);
-        if (existingSession?.generatorPromise) {
-          result.sessionsSkipped++;
-          continue;
-        }
-
         const session = this.sessionManager.initializeSession(sessionDbId);
-        logger.info('SYSTEM', `Starting processor for session ${sessionDbId}`, {
-          project: session.project,
-          pendingCount: pendingStore.getPendingCount(sessionDbId)
-        });
-
         this.startSessionProcessor(session, 'startup-recovery');
         result.sessionsStarted++;
         result.startedSessionIds.push(sessionDbId);
-
-        await new Promise(resolve => setTimeout(resolve, 100));
       } catch (error) {
-        logger.error('SYSTEM', `Failed to process session ${sessionDbId}`, {}, error as Error);
+        if (error instanceof Error) {
+          logger.error('WORKER', `Failed to initialize/start session ${sessionDbId}`, { sessionDbId }, error);
+        } else {
+          logger.error('WORKER', `Failed to initialize/start session ${sessionDbId} with non-Error`, { sessionDbId }, new Error(String(error)));
+        }
         result.sessionsSkipped++;
+        // [ANTI-PATTERN IGNORED]: Per-session failure must not abort the loop; other sessions may still be recoverable
+        continue;
       }
+
+      logger.info('SYSTEM', `Starting processor for session ${sessionDbId}`, {
+        project: this.sessionManager.getSession(sessionDbId)?.project,
+        pendingCount: pendingStore.getPendingCount(sessionDbId)
+      });
+
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
     return result;
@@ -937,23 +1042,10 @@ export class WorkerService {
    * Shutdown the worker service
    */
   async shutdown(): Promise<void> {
-    // Stop orphan reaper before shutdown (Issue #737)
-    if (this.stopOrphanReaper) {
-      this.stopOrphanReaper();
-      this.stopOrphanReaper = null;
-    }
-
-    // Stop stale session reaper (Issue #1168)
-    if (this.staleSessionReaperInterval) {
-      clearInterval(this.staleSessionReaperInterval);
-      this.staleSessionReaperInterval = null;
-    }
-
-    // Stop transcript watcher
     if (this.transcriptWatcher) {
       this.transcriptWatcher.stop();
       this.transcriptWatcher = null;
-      logger.info('SYSTEM', 'Transcript watcher stopped');
+      logger.info('TRANSCRIPT', 'Transcript watcher stopped');
     }
 
     await performGracefulShutdown({
@@ -993,115 +1085,22 @@ export class WorkerService {
 
 /**
  * Ensures the worker is started and healthy.
- * This function can be called by both 'start' and 'hook' commands.
+ *
+ * Thin wrapper around the canonical implementation in ./worker-spawner.ts.
+ *
+ * `__filename` is forwarded as the worker script path because, in the CJS
+ * bundle that ships to users, `__filename` always resolves to the compiled
+ * `worker-service.cjs` itself — which is exactly the script the spawner
+ * needs to relaunch as a detached daemon. The MCP server (a separate Node
+ * bundle) cannot rely on its own `__filename` because that would point at
+ * `mcp-server.cjs`, so it computes the worker path explicitly via
+ * `dirname(__filename) + 'worker-service.cjs'` instead.
  *
  * @param port - The TCP port (used for port-in-use checks and daemon spawn)
  * @returns true if worker is healthy (existing or newly started), false on failure
  */
-async function ensureWorkerStarted(port: number): Promise<boolean> {
-  // Clean stale PID file first (cheap: 1 fs read + 1 signal-0 check)
-  const pidFileStatus = cleanStalePidFile();
-  if (pidFileStatus === 'alive') {
-    logger.info('SYSTEM', 'Worker PID file points to a live process, skipping duplicate spawn');
-    const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.PORT_IN_USE_WAIT));
-    if (healthy) {
-      logger.info('SYSTEM', 'Worker became healthy while waiting on live PID');
-      return true;
-    }
-    logger.warn('SYSTEM', 'Live PID detected but worker did not become healthy before timeout');
-    return false;
-  }
-
-  // Check if worker is already running and healthy
-  if (await waitForHealth(port, 1000)) {
-    const versionCheck = await checkVersionMatch(port);
-    if (!versionCheck.matches) {
-      // Guard: If PID file was written recently, another session is likely already
-      // restarting the worker. Poll health instead of starting a concurrent restart.
-      // This prevents the "100 sessions all restart simultaneously" storm (#1145).
-      const RESTART_COORDINATION_THRESHOLD_MS = 15000;
-      if (isPidFileRecent(RESTART_COORDINATION_THRESHOLD_MS)) {
-        logger.info('SYSTEM', 'Version mismatch detected but PID file is recent — another restart likely in progress, polling health', {
-          pluginVersion: versionCheck.pluginVersion,
-          workerVersion: versionCheck.workerVersion
-        });
-        const healthy = await waitForHealth(port, RESTART_COORDINATION_THRESHOLD_MS);
-        if (healthy) {
-          logger.info('SYSTEM', 'Worker became healthy after waiting for concurrent restart');
-          return true;
-        }
-        logger.warn('SYSTEM', 'Worker did not become healthy after waiting — proceeding with own restart');
-      }
-
-      logger.info('SYSTEM', 'Worker version mismatch detected - auto-restarting', {
-        pluginVersion: versionCheck.pluginVersion,
-        workerVersion: versionCheck.workerVersion
-      });
-
-      await httpShutdown(port);
-      const freed = await waitForPortFree(port, getPlatformTimeout(HOOK_TIMEOUTS.PORT_IN_USE_WAIT));
-      if (!freed) {
-        logger.error('SYSTEM', 'Port did not free up after shutdown for version mismatch restart', { port });
-        return false;
-      }
-      removePidFile();
-    } else {
-      logger.info('SYSTEM', 'Worker already running and healthy');
-      return true;
-    }
-  }
-
-  // Check if port is in use by something else
-  const portInUse = await isPortInUse(port);
-  if (portInUse) {
-    logger.info('SYSTEM', 'Port in use, waiting for worker to become healthy');
-    const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.PORT_IN_USE_WAIT));
-    if (healthy) {
-      logger.info('SYSTEM', 'Worker is now healthy');
-      return true;
-    }
-    logger.error('SYSTEM', 'Port in use but worker not responding to health checks');
-    return false;
-  }
-
-  // Windows: skip spawn if a recent attempt already failed (prevents repeated bun.exe popups, issue #921)
-  if (shouldSkipSpawnOnWindows()) {
-    logger.warn('SYSTEM', 'Worker unavailable on Windows — skipping spawn (recent attempt failed within cooldown)');
-    return false;
-  }
-
-  // Spawn new worker daemon
-  logger.info('SYSTEM', 'Starting worker daemon');
-  markWorkerSpawnAttempted();
-  const pid = spawnDaemon(__filename, port);
-  if (pid === undefined) {
-    logger.error('SYSTEM', 'Failed to spawn worker daemon');
-    return false;
-  }
-
-  // PID file is written by the worker itself after listen() succeeds
-  // This is race-free and works correctly on Windows where cmd.exe PID is useless
-
-  const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
-  if (!healthy) {
-    removePidFile();
-    logger.error('SYSTEM', 'Worker failed to start (health check timeout)');
-    return false;
-  }
-
-  // Health passed (HTTP listening). Now wait for DB + search initialization
-  // so hooks that run immediately after can actually use the worker.
-  const ready = await waitForReadiness(port, getPlatformTimeout(HOOK_TIMEOUTS.READINESS_WAIT));
-  if (!ready) {
-    logger.warn('SYSTEM', 'Worker is alive but readiness timed out — proceeding anyway');
-  }
-
-  clearWorkerSpawnAttempted();
-  // Touch PID file to signal other sessions that a restart just completed.
-  // Other sessions checking isPidFileRecent() will see this and skip their own restart.
-  touchPidFile();
-  logger.info('SYSTEM', 'Worker started successfully');
-  return true;
+export async function ensureWorkerStarted(port: number): Promise<boolean> {
+  return ensureWorkerStartedShared(port, __filename);
 }
 
 // ============================================================================
@@ -1154,34 +1153,21 @@ async function main() {
     case 'restart': {
       logger.info('SYSTEM', 'Restarting worker');
       await httpShutdown(port);
-      const restartFreed = await waitForPortFree(port, getPlatformTimeout(15000));
+      const restartFreed = await waitForPortFree(port, 5000);
       if (!restartFreed) {
-        logger.error('SYSTEM', 'Port did not free up after shutdown, aborting restart', { port });
-        process.exit(0);
+        // Don't loop, don't force-kill, don't steal the port. The PID file
+        // owns the lock; if the previous worker won't release the port the
+        // user resolves it manually.
+        console.error('Port still bound after shutdown. Resolve manually.');
+        process.exit(1);
       }
       removePidFile();
-
-      const pid = spawnDaemon(__filename, port);
-      if (pid === undefined) {
-        logger.error('SYSTEM', 'Failed to spawn worker daemon during restart');
-        // Exit gracefully: Windows Terminal won't keep tab open on exit 0
-        // The wrapper/plugin will handle restart logic if needed
-        process.exit(0);
+      const restartPid = spawnDaemon(__filename, port);
+      if (restartPid === undefined) {
+        console.error('Failed to spawn worker daemon during restart.');
+        process.exit(1);
       }
-
-      // PID file is written by the worker itself after listen() succeeds
-      // This is race-free and works correctly on Windows where cmd.exe PID is useless
-
-      const healthy = await waitForHealth(port, getPlatformTimeout(HOOK_TIMEOUTS.POST_SPAWN_WAIT));
-      if (!healthy) {
-        removePidFile();
-        logger.error('SYSTEM', 'Worker failed to restart');
-        // Exit gracefully: Windows Terminal won't keep tab open on exit 0
-        // The wrapper/plugin will handle restart logic if needed
-        process.exit(0);
-      }
-
-      logger.info('SYSTEM', 'Worker restarted successfully');
+      logger.info('SYSTEM', 'Worker restart spawned', { pid: restartPid });
       process.exit(0);
       break;
     }
@@ -1222,7 +1208,7 @@ async function main() {
       if (!platform || !event) {
         console.error('Usage: claude-mem hook <platform> <event>');
         console.error('Platforms: claude-code, cursor, gemini-cli, raw');
-        console.error('Events: context, session-init, observation, summarize, session-complete, user-message');
+        console.error('Events: context, session-init, observation, summarize, user-message');
         process.exit(1);
       }
 
@@ -1285,12 +1271,74 @@ async function main() {
       break;
     }
 
+    case 'adopt': {
+      const dryRun = process.argv.includes('--dry-run');
+      const branchIndex = process.argv.indexOf('--branch');
+      const branchValue = branchIndex !== -1 ? process.argv[branchIndex + 1] : undefined;
+      if (branchIndex !== -1 && (!branchValue || branchValue.startsWith('--'))) {
+        console.error('Usage: adopt [--dry-run] [--branch <branch>] [--cwd <path>]');
+        process.exit(1);
+      }
+      const onlyBranch = branchValue;
+      // Honor an explicit --cwd override so the NPX CLI can pass through the
+      // user's working directory (the spawn sets cwd to the marketplace dir).
+      const cwdIndex = process.argv.indexOf('--cwd');
+      const cwdValue = cwdIndex !== -1 ? process.argv[cwdIndex + 1] : undefined;
+      if (cwdIndex !== -1 && (!cwdValue || cwdValue.startsWith('--'))) {
+        console.error('Usage: adopt [--dry-run] [--branch <branch>] [--cwd <path>]');
+        process.exit(1);
+      }
+      const repoPath = cwdValue ?? process.cwd();
+
+      const result = await adoptMergedWorktrees({ repoPath, dryRun, onlyBranch });
+
+      const tag = result.dryRun ? '(dry-run)' : '(applied)';
+      console.log(`\nWorktree adoption ${tag}`);
+      console.log(`  Parent project:       ${result.parentProject || '(unknown)'}`);
+      console.log(`  Repo:                 ${result.repoPath}`);
+      console.log(`  Worktrees scanned:    ${result.scannedWorktrees}`);
+      console.log(`  Merged branches:      ${result.mergedBranches.join(', ') || '(none)'}`);
+      console.log(`  Observations adopted: ${result.adoptedObservations}`);
+      console.log(`  Summaries adopted:    ${result.adoptedSummaries}`);
+      console.log(`  Chroma docs updated:  ${result.chromaUpdates}`);
+      if (result.chromaFailed > 0) {
+        console.log(`  Chroma sync failures: ${result.chromaFailed} (will retry on next run)`);
+      }
+      for (const err of result.errors) {
+        console.log(`  ! ${err.worktree}: ${err.error}`);
+      }
+      process.exit(0);
+    }
+
+    case 'cleanup': {
+      // CLI surface for the v12.4.3 pollution cleanup. Shares its scan logic
+      // with the auto-run-on-startup path so --dry-run reports counts that
+      // exactly match what the next startup would delete. (#2126 item 5)
+      const dryRun = process.argv.includes('--dry-run');
+      const counts = runOneTimeV12_4_3Cleanup(undefined, { dryRun });
+      const tag = dryRun ? '(dry-run, no changes made)' : '(applied)';
+      console.log(`\nv12.4.3 cleanup ${tag}`);
+      if (counts) {
+        console.log(`  Observer sessions:        ${counts.observerSessions}`);
+        console.log(`  Observer cascade rows:    ${counts.observerCascadeRows}`);
+        console.log(`  Stuck pending_messages:   ${counts.stuckPendingMessages}`);
+      } else if (dryRun) {
+        console.log('  Scan failed — see worker log for details.');
+      } else {
+        console.log('  Already applied (marker present) or skipped.');
+      }
+      process.exit(0);
+    }
+
     case '--daemon':
     default: {
-      // GUARD 1: Refuse to start if another worker is already alive (PID check).
-      // Instant check (kill -0) — no HTTP dependency.
+      // GUARD 1: Refuse to start if another worker is already alive.
+      // Verifies PID *identity* (via start-time token) not just liveness, so a
+      // stale PID file pointing at a PID that's since been reused by an
+      // unrelated process (e.g. container restart reusing low PIDs) doesn't
+      // false-positive.
       const existingPidInfo = readPidFile();
-      if (existingPidInfo && isProcessAlive(existingPidInfo.pid)) {
+      if (verifyPidFileOwnership(existingPidInfo)) {
         logger.info('SYSTEM', 'Worker already running (PID alive), refusing to start duplicate', {
           existingPid: existingPidInfo.pid,
           existingPort: existingPidInfo.port,
@@ -1322,7 +1370,18 @@ async function main() {
       });
 
       const worker = new WorkerService();
-      worker.start().catch((error) => {
+      worker.start().catch(async (error) => {
+        // Port race: when the MCP server and SessionStart hook both spawn a daemon
+        // concurrently, one will lose the bind race with EADDRINUSE or Bun's equivalent
+        // "port in use" error. If the winner is already healthy, exit cleanly (#1447).
+        const isPortConflict = error instanceof Error && (
+          (error as NodeJS.ErrnoException).code === 'EADDRINUSE' ||
+          /port.*in use|address.*in use/i.test(error.message)
+        );
+        if (isPortConflict && await waitForHealth(port, 3000)) {
+          logger.info('SYSTEM', 'Duplicate daemon exiting — another worker already claimed port', { port });
+          process.exit(0);
+        }
         logger.failure('SYSTEM', 'Worker failed to start', {}, error as Error);
         removePidFile();
         // Exit gracefully: Windows Terminal won't keep tab open on exit 0
@@ -1334,8 +1393,10 @@ async function main() {
 }
 
 // Check if running as main module in both ESM and CommonJS
+// The CLAUDE_MEM_MANAGED check handles Bun on Windows where require.main !== module
+// in CJS mode despite being the entry point (see #1450)
 const isMainModule = typeof require !== 'undefined' && typeof module !== 'undefined'
-  ? require.main === module || !module.parent
+  ? require.main === module || !module.parent || process.env.CLAUDE_MEM_MANAGED === 'true'
   : import.meta.url === `file://${process.argv[1]}`
     || process.argv[1]?.endsWith('worker-service')
     || process.argv[1]?.endsWith('worker-service.cjs')

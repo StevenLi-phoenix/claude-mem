@@ -10,7 +10,7 @@ import { homedir } from 'os';
 import { unlinkSync } from 'fs';
 import { SessionStore } from '../sqlite/SessionStore.js';
 import { logger } from '../../utils/logger.js';
-import { getProjectName } from '../../utils/project-name.js';
+import { getProjectContext } from '../../utils/project-name.js';
 
 import type { ContextInput, ContextConfig, Observation, SessionSummary } from './types.js';
 import { loadContextConfig } from './ContextConfigLoader.js';
@@ -29,8 +29,8 @@ import { renderHeader } from './sections/HeaderRenderer.js';
 import { renderTimeline } from './sections/TimelineRenderer.js';
 import { shouldShowSummary, renderSummaryFields } from './sections/SummaryRenderer.js';
 import { renderPreviouslySection, renderFooter } from './sections/FooterRenderer.js';
-import { renderMarkdownEmptyState } from './formatters/MarkdownFormatter.js';
-import { renderColorEmptyState } from './formatters/ColorFormatter.js';
+import { renderAgentEmptyState } from './formatters/AgentFormatter.js';
+import { renderHumanEmptyState } from './formatters/HumanFormatter.js';
 
 // Version marker path for native module error handling
 const VERSION_MARKER_PATH = path.join(
@@ -49,14 +49,18 @@ const VERSION_MARKER_PATH = path.join(
 function initializeDatabase(): SessionStore | null {
   try {
     return new SessionStore();
-  } catch (error: any) {
-    if (error.code === 'ERR_DLOPEN_FAILED') {
+  } catch (error: unknown) {
+    if (error instanceof Error && (error as NodeJS.ErrnoException).code === 'ERR_DLOPEN_FAILED') {
       try {
         unlinkSync(VERSION_MARKER_PATH);
       } catch (unlinkError) {
-        logger.debug('SYSTEM', 'Marker file cleanup failed (may not exist)', {}, unlinkError as Error);
+        if (unlinkError instanceof Error) {
+          logger.debug('WORKER', 'Marker file cleanup failed (may not exist)', {}, unlinkError);
+        } else {
+          logger.debug('WORKER', 'Marker file cleanup failed (may not exist)', { error: String(unlinkError) });
+        }
       }
-      logger.error('SYSTEM', 'Native module rebuild needed - restart Claude Code to auto-fix');
+      logger.error('WORKER', 'Native module rebuild needed - restart Claude Code to auto-fix');
       return null;
     }
     throw error;
@@ -66,8 +70,8 @@ function initializeDatabase(): SessionStore | null {
 /**
  * Render empty state when no data exists
  */
-function renderEmptyState(project: string, useColors: boolean): string {
-  return useColors ? renderColorEmptyState(project) : renderMarkdownEmptyState(project);
+function renderEmptyState(project: string, forHuman: boolean): string {
+  return forHuman ? renderHumanEmptyState(project) : renderAgentEmptyState(project);
 }
 
 /**
@@ -80,7 +84,7 @@ function buildContextOutput(
   config: ContextConfig,
   cwd: string,
   sessionId: string | undefined,
-  useColors: boolean
+  forHuman: boolean
 ): string {
   const output: string[] = [];
 
@@ -88,7 +92,7 @@ function buildContextOutput(
   const economics = calculateTokenEconomics(observations);
 
   // Render header section
-  output.push(...renderHeader(project, economics, config, useColors));
+  output.push(...renderHeader(project, economics, config, forHuman));
 
   // Prepare timeline data
   const displaySummaries = summaries.slice(0, config.sessionCount);
@@ -97,22 +101,22 @@ function buildContextOutput(
   const fullObservationIds = getFullObservationIds(observations, config.fullObservationCount);
 
   // Render timeline
-  output.push(...renderTimeline(timeline, fullObservationIds, config, cwd, useColors));
+  output.push(...renderTimeline(timeline, fullObservationIds, config, cwd, forHuman));
 
   // Render most recent summary if applicable
   const mostRecentSummary = summaries[0];
   const mostRecentObservation = observations[0];
 
   if (shouldShowSummary(config, mostRecentSummary, mostRecentObservation)) {
-    output.push(...renderSummaryFields(mostRecentSummary, useColors));
+    output.push(...renderSummaryFields(mostRecentSummary, forHuman));
   }
 
   // Render previously section (prior assistant message)
   const priorMessages = getPriorSessionMessages(observations, config, sessionId, cwd);
-  output.push(...renderPreviouslySection(priorMessages, useColors));
+  output.push(...renderPreviouslySection(priorMessages, forHuman));
 
   // Render footer
-  output.push(...renderFooter(economics, config, useColors));
+  output.push(...renderFooter(economics, config, forHuman));
 
   return output.join('\n').trimEnd();
 }
@@ -125,14 +129,18 @@ function buildContextOutput(
  */
 export async function generateContext(
   input?: ContextInput,
-  useColors: boolean = false
+  forHuman: boolean = false
 ): Promise<string> {
   const config = loadContextConfig();
   const cwd = input?.cwd ?? process.cwd();
-  const project = getProjectName(cwd);
+  const context = getProjectContext(cwd);
 
-  // Use provided projects array (for worktree support) or fall back to single project
-  const projects = input?.projects || [project];
+  // Single source of truth: explicit projects override cwd-derived context.
+  // `project` (used for header + single-project query) is always the last entry
+  // of `projects` so the empty-state header and the query target stay in sync
+  // when a caller passes `projects` without a matching cwd (e.g. worker route).
+  const projects = input?.projects?.length ? input.projects : context.allProjects;
+  const project = projects[projects.length - 1] ?? context.primary;
 
   // Full mode: fetch all observations but keep normal rendering (level 1 summaries)
   if (input?.full) {
@@ -157,7 +165,7 @@ export async function generateContext(
 
     // Handle empty state
     if (observations.length === 0 && summaries.length === 0) {
-      return renderEmptyState(project, useColors);
+      return renderEmptyState(project, forHuman);
     }
 
     // Build and return context
@@ -168,7 +176,7 @@ export async function generateContext(
       config,
       cwd,
       input?.session_id,
-      useColors
+      forHuman
     );
 
     return output;

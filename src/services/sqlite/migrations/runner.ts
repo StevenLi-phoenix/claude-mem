@@ -6,6 +6,7 @@ import {
   TableNameRow,
   SchemaVersion
 } from '../../../types/database.js';
+import { DEFAULT_PLATFORM_SOURCE } from '../../../shared/platform-source.js';
 
 /**
  * MigrationRunner handles all database schema migrations
@@ -29,12 +30,17 @@ export class MigrationRunner {
     this.ensureDiscoveryTokensColumn();
     this.createPendingMessagesTable();
     this.renameSessionIdColumns();
-    this.repairSessionIdColumnRename();
     this.addFailedAtEpochColumn();
     this.addOnUpdateCascadeToForeignKeys();
     this.addObservationContentHashColumn();
     this.addSessionCustomTitleColumn();
     this.createObservationFeedbackTable();
+    this.addSessionPlatformSourceColumn();
+    this.ensureMergedIntoProjectColumns();
+    this.addObservationSubagentColumns();
+    this.rebuildPendingMessagesForSelfHealingClaim();
+    this.addObservationsUniqueContentHashIndex();
+    this.addObservationsMetadataColumn();
   }
 
   /**
@@ -62,6 +68,7 @@ export class MigrationRunner {
         content_session_id TEXT UNIQUE NOT NULL,
         memory_session_id TEXT UNIQUE,
         project TEXT NOT NULL,
+        platform_source TEXT NOT NULL DEFAULT 'claude',
         user_prompt TEXT,
         started_at TEXT NOT NULL,
         started_at_epoch INTEGER NOT NULL,
@@ -186,7 +193,7 @@ export class MigrationRunner {
   private removeSessionSummariesUniqueConstraint(): void {
     // Check actual constraint state — don't rely on version tracking alone (issue #979)
     const summariesIndexes = this.db.query('PRAGMA index_list(session_summaries)').all() as IndexInfo[];
-    const hasUniqueConstraint = summariesIndexes.some(idx => idx.unique === 1);
+    const hasUniqueConstraint = summariesIndexes.some(idx => idx.unique === 1 && idx.origin !== 'pk');
 
     if (!hasUniqueConstraint) {
       // Already migrated (no constraint exists)
@@ -414,35 +421,9 @@ export class MigrationRunner {
     // Create FTS5 virtual table — skip if FTS5 is unavailable (e.g., Bun on Windows #791).
     // The user_prompts table itself is still created; only FTS indexing is skipped.
     try {
-      this.db.run(`
-        CREATE VIRTUAL TABLE user_prompts_fts USING fts5(
-          prompt_text,
-          content='user_prompts',
-          content_rowid='id'
-        );
-      `);
-
-      // Create triggers to sync FTS5
-      this.db.run(`
-        CREATE TRIGGER user_prompts_ai AFTER INSERT ON user_prompts BEGIN
-          INSERT INTO user_prompts_fts(rowid, prompt_text)
-          VALUES (new.id, new.prompt_text);
-        END;
-
-        CREATE TRIGGER user_prompts_ad AFTER DELETE ON user_prompts BEGIN
-          INSERT INTO user_prompts_fts(user_prompts_fts, rowid, prompt_text)
-          VALUES('delete', old.id, old.prompt_text);
-        END;
-
-        CREATE TRIGGER user_prompts_au AFTER UPDATE ON user_prompts BEGIN
-          INSERT INTO user_prompts_fts(user_prompts_fts, rowid, prompt_text)
-          VALUES('delete', old.id, old.prompt_text);
-          INSERT INTO user_prompts_fts(rowid, prompt_text)
-          VALUES (new.id, new.prompt_text);
-        END;
-      `);
+      this.createUserPromptsFTS();
     } catch (ftsError) {
-      logger.warn('DB', 'FTS5 not available — user_prompts_fts skipped (search uses ChromaDB)', {}, ftsError as Error);
+      logger.warn('DB', 'FTS5 not available — user_prompts_fts skipped (search uses ChromaDB)', {}, ftsError instanceof Error ? ftsError : new Error(String(ftsError)));
     }
 
     // Commit transaction
@@ -452,6 +433,39 @@ export class MigrationRunner {
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(10, new Date().toISOString());
 
     logger.debug('DB', 'Successfully created user_prompts table');
+  }
+
+  /**
+   * Create FTS5 virtual table and sync triggers for user_prompts.
+   * Extracted from createUserPromptsTable to keep try block small.
+   */
+  private createUserPromptsFTS(): void {
+    this.db.run(`
+      CREATE VIRTUAL TABLE user_prompts_fts USING fts5(
+        prompt_text,
+        content='user_prompts',
+        content_rowid='id'
+      );
+    `);
+
+    this.db.run(`
+      CREATE TRIGGER user_prompts_ai AFTER INSERT ON user_prompts BEGIN
+        INSERT INTO user_prompts_fts(rowid, prompt_text)
+        VALUES (new.id, new.prompt_text);
+      END;
+
+      CREATE TRIGGER user_prompts_ad AFTER DELETE ON user_prompts BEGIN
+        INSERT INTO user_prompts_fts(user_prompts_fts, rowid, prompt_text)
+        VALUES('delete', old.id, old.prompt_text);
+      END;
+
+      CREATE TRIGGER user_prompts_au AFTER UPDATE ON user_prompts BEGIN
+        INSERT INTO user_prompts_fts(user_prompts_fts, rowid, prompt_text)
+        VALUES('delete', old.id, old.prompt_text);
+        INSERT INTO user_prompts_fts(rowid, prompt_text)
+        VALUES (new.id, new.prompt_text);
+      END;
+    `);
   }
 
   /**
@@ -521,7 +535,6 @@ export class MigrationRunner {
         status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'processed', 'failed')),
         retry_count INTEGER NOT NULL DEFAULT 0,
         created_at_epoch INTEGER NOT NULL,
-        started_processing_at_epoch INTEGER,
         completed_at_epoch INTEGER,
         FOREIGN KEY (session_db_id) REFERENCES sdk_sessions(id) ON DELETE CASCADE
       )
@@ -602,22 +615,8 @@ export class MigrationRunner {
   }
 
   /**
-   * Repair session ID column renames (migration 19)
-   * DEPRECATED: Migration 17 is now fully idempotent and handles all cases.
-   * This migration is kept for backwards compatibility but does nothing.
-   */
-  private repairSessionIdColumnRename(): void {
-    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(19) as SchemaVersion | undefined;
-    if (applied) return;
-
-    // Migration 17 now handles all column rename cases idempotently.
-    // Just record this migration as applied.
-    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(19, new Date().toISOString());
-  }
-
-  /**
    * Add failed_at_epoch column to pending_messages (migration 20)
-   * Used by markSessionMessagesFailed() for error recovery tracking
+   * Used by transitionMessagesTo() for error recovery tracking
    */
   private addFailedAtEpochColumn(): void {
     const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(20) as SchemaVersion | undefined;
@@ -654,159 +653,10 @@ export class MigrationRunner {
     this.db.run('BEGIN TRANSACTION');
 
     try {
-      // ==========================================
-      // 1. Recreate observations table
-      // ==========================================
+      this.recreateObservationsWithUpdateCascade();
+      this.recreateSessionSummariesWithUpdateCascade();
 
-      // Drop FTS triggers first (they reference the observations table)
-      this.db.run('DROP TRIGGER IF EXISTS observations_ai');
-      this.db.run('DROP TRIGGER IF EXISTS observations_ad');
-      this.db.run('DROP TRIGGER IF EXISTS observations_au');
-
-      // Clean up leftover temp table from a previously-crashed run
-      this.db.run('DROP TABLE IF EXISTS observations_new');
-
-      this.db.run(`
-        CREATE TABLE observations_new (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          memory_session_id TEXT NOT NULL,
-          project TEXT NOT NULL,
-          text TEXT,
-          type TEXT NOT NULL,
-          title TEXT,
-          subtitle TEXT,
-          facts TEXT,
-          narrative TEXT,
-          concepts TEXT,
-          files_read TEXT,
-          files_modified TEXT,
-          prompt_number INTEGER,
-          discovery_tokens INTEGER DEFAULT 0,
-          created_at TEXT NOT NULL,
-          created_at_epoch INTEGER NOT NULL,
-          FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE ON UPDATE CASCADE
-        )
-      `);
-
-      this.db.run(`
-        INSERT INTO observations_new
-        SELECT id, memory_session_id, project, text, type, title, subtitle, facts,
-               narrative, concepts, files_read, files_modified, prompt_number,
-               discovery_tokens, created_at, created_at_epoch
-        FROM observations
-      `);
-
-      this.db.run('DROP TABLE observations');
-      this.db.run('ALTER TABLE observations_new RENAME TO observations');
-
-      // Recreate indexes
-      this.db.run(`
-        CREATE INDEX idx_observations_sdk_session ON observations(memory_session_id);
-        CREATE INDEX idx_observations_project ON observations(project);
-        CREATE INDEX idx_observations_type ON observations(type);
-        CREATE INDEX idx_observations_created ON observations(created_at_epoch DESC);
-      `);
-
-      // Recreate FTS triggers only if observations_fts exists
-      const hasFTS = (this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='observations_fts'").all() as { name: string }[]).length > 0;
-      if (hasFTS) {
-        this.db.run(`
-          CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations BEGIN
-            INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
-            VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
-          END;
-
-          CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations BEGIN
-            INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts)
-            VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
-          END;
-
-          CREATE TRIGGER IF NOT EXISTS observations_au AFTER UPDATE ON observations BEGIN
-            INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts)
-            VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
-            INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
-            VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
-          END;
-        `);
-      }
-
-      // ==========================================
-      // 2. Recreate session_summaries table
-      // ==========================================
-
-      // Clean up leftover temp table from a previously-crashed run
-      this.db.run('DROP TABLE IF EXISTS session_summaries_new');
-
-      this.db.run(`
-        CREATE TABLE session_summaries_new (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          memory_session_id TEXT NOT NULL,
-          project TEXT NOT NULL,
-          request TEXT,
-          investigated TEXT,
-          learned TEXT,
-          completed TEXT,
-          next_steps TEXT,
-          files_read TEXT,
-          files_edited TEXT,
-          notes TEXT,
-          prompt_number INTEGER,
-          discovery_tokens INTEGER DEFAULT 0,
-          created_at TEXT NOT NULL,
-          created_at_epoch INTEGER NOT NULL,
-          FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE ON UPDATE CASCADE
-        )
-      `);
-
-      this.db.run(`
-        INSERT INTO session_summaries_new
-        SELECT id, memory_session_id, project, request, investigated, learned,
-               completed, next_steps, files_read, files_edited, notes,
-               prompt_number, discovery_tokens, created_at, created_at_epoch
-        FROM session_summaries
-      `);
-
-      // Drop session_summaries FTS triggers before dropping the table
-      this.db.run('DROP TRIGGER IF EXISTS session_summaries_ai');
-      this.db.run('DROP TRIGGER IF EXISTS session_summaries_ad');
-      this.db.run('DROP TRIGGER IF EXISTS session_summaries_au');
-
-      this.db.run('DROP TABLE session_summaries');
-      this.db.run('ALTER TABLE session_summaries_new RENAME TO session_summaries');
-
-      // Recreate indexes
-      this.db.run(`
-        CREATE INDEX idx_session_summaries_sdk_session ON session_summaries(memory_session_id);
-        CREATE INDEX idx_session_summaries_project ON session_summaries(project);
-        CREATE INDEX idx_session_summaries_created ON session_summaries(created_at_epoch DESC);
-      `);
-
-      // Recreate session_summaries FTS triggers if FTS table exists
-      const hasSummariesFTS = (this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='session_summaries_fts'").all() as { name: string }[]).length > 0;
-      if (hasSummariesFTS) {
-        this.db.run(`
-          CREATE TRIGGER IF NOT EXISTS session_summaries_ai AFTER INSERT ON session_summaries BEGIN
-            INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
-            VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
-          END;
-
-          CREATE TRIGGER IF NOT EXISTS session_summaries_ad AFTER DELETE ON session_summaries BEGIN
-            INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes)
-            VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
-          END;
-
-          CREATE TRIGGER IF NOT EXISTS session_summaries_au AFTER UPDATE ON session_summaries BEGIN
-            INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes)
-            VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
-            INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
-            VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
-          END;
-        `);
-      }
-
-      // Record migration
       this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(21, new Date().toISOString());
-
       this.db.run('COMMIT');
       this.db.run('PRAGMA foreign_keys = ON');
 
@@ -814,7 +664,162 @@ export class MigrationRunner {
     } catch (error) {
       this.db.run('ROLLBACK');
       this.db.run('PRAGMA foreign_keys = ON');
-      throw error;
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(`Migration 21 failed: ${String(error)}`);
+    }
+  }
+
+  /**
+   * Recreate observations table with ON UPDATE CASCADE FK constraint.
+   * Called within a transaction by addOnUpdateCascadeToForeignKeys.
+   */
+  private recreateObservationsWithUpdateCascade(): void {
+    // Drop FTS triggers first (they reference the observations table)
+    this.db.run('DROP TRIGGER IF EXISTS observations_ai');
+    this.db.run('DROP TRIGGER IF EXISTS observations_ad');
+    this.db.run('DROP TRIGGER IF EXISTS observations_au');
+
+    // Clean up leftover temp table from a previously-crashed run
+    this.db.run('DROP TABLE IF EXISTS observations_new');
+
+    this.db.run(`
+      CREATE TABLE observations_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_session_id TEXT NOT NULL,
+        project TEXT NOT NULL,
+        text TEXT,
+        type TEXT NOT NULL,
+        title TEXT,
+        subtitle TEXT,
+        facts TEXT,
+        narrative TEXT,
+        concepts TEXT,
+        files_read TEXT,
+        files_modified TEXT,
+        prompt_number INTEGER,
+        discovery_tokens INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        created_at_epoch INTEGER NOT NULL,
+        FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE ON UPDATE CASCADE
+      )
+    `);
+
+    this.db.run(`
+      INSERT INTO observations_new
+      SELECT id, memory_session_id, project, text, type, title, subtitle, facts,
+             narrative, concepts, files_read, files_modified, prompt_number,
+             discovery_tokens, created_at, created_at_epoch
+      FROM observations
+    `);
+
+    this.db.run('DROP TABLE observations');
+    this.db.run('ALTER TABLE observations_new RENAME TO observations');
+
+    this.db.run(`
+      CREATE INDEX idx_observations_sdk_session ON observations(memory_session_id);
+      CREATE INDEX idx_observations_project ON observations(project);
+      CREATE INDEX idx_observations_type ON observations(type);
+      CREATE INDEX idx_observations_created ON observations(created_at_epoch DESC);
+    `);
+
+    // Recreate FTS triggers only if observations_fts exists
+    const hasFTS = (this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='observations_fts'").all() as { name: string }[]).length > 0;
+    if (hasFTS) {
+      this.db.run(`
+        CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations BEGIN
+          INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
+          VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS observations_ad AFTER DELETE ON observations BEGIN
+          INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts)
+          VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS observations_au AFTER UPDATE ON observations BEGIN
+          INSERT INTO observations_fts(observations_fts, rowid, title, subtitle, narrative, text, facts, concepts)
+          VALUES('delete', old.id, old.title, old.subtitle, old.narrative, old.text, old.facts, old.concepts);
+          INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
+          VALUES (new.id, new.title, new.subtitle, new.narrative, new.text, new.facts, new.concepts);
+        END;
+      `);
+    }
+  }
+
+  /**
+   * Recreate session_summaries table with ON UPDATE CASCADE FK constraint.
+   * Called within a transaction by addOnUpdateCascadeToForeignKeys.
+   */
+  private recreateSessionSummariesWithUpdateCascade(): void {
+    // Clean up leftover temp table from a previously-crashed run
+    this.db.run('DROP TABLE IF EXISTS session_summaries_new');
+
+    this.db.run(`
+      CREATE TABLE session_summaries_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_session_id TEXT NOT NULL,
+        project TEXT NOT NULL,
+        request TEXT,
+        investigated TEXT,
+        learned TEXT,
+        completed TEXT,
+        next_steps TEXT,
+        files_read TEXT,
+        files_edited TEXT,
+        notes TEXT,
+        prompt_number INTEGER,
+        discovery_tokens INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        created_at_epoch INTEGER NOT NULL,
+        FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE ON UPDATE CASCADE
+      )
+    `);
+
+    this.db.run(`
+      INSERT INTO session_summaries_new
+      SELECT id, memory_session_id, project, request, investigated, learned,
+             completed, next_steps, files_read, files_edited, notes,
+             prompt_number, discovery_tokens, created_at, created_at_epoch
+      FROM session_summaries
+    `);
+
+    // Drop session_summaries FTS triggers before dropping the table
+    this.db.run('DROP TRIGGER IF EXISTS session_summaries_ai');
+    this.db.run('DROP TRIGGER IF EXISTS session_summaries_ad');
+    this.db.run('DROP TRIGGER IF EXISTS session_summaries_au');
+
+    this.db.run('DROP TABLE session_summaries');
+    this.db.run('ALTER TABLE session_summaries_new RENAME TO session_summaries');
+
+    this.db.run(`
+      CREATE INDEX idx_session_summaries_sdk_session ON session_summaries(memory_session_id);
+      CREATE INDEX idx_session_summaries_project ON session_summaries(project);
+      CREATE INDEX idx_session_summaries_created ON session_summaries(created_at_epoch DESC);
+    `);
+
+    // Recreate session_summaries FTS triggers if FTS table exists
+    const hasSummariesFTS = (this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='session_summaries_fts'").all() as { name: string }[]).length > 0;
+    if (hasSummariesFTS) {
+      this.db.run(`
+        CREATE TRIGGER IF NOT EXISTS session_summaries_ai AFTER INSERT ON session_summaries BEGIN
+          INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
+          VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_summaries_ad AFTER DELETE ON session_summaries BEGIN
+          INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes)
+          VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS session_summaries_au AFTER UPDATE ON session_summaries BEGIN
+          INSERT INTO session_summaries_fts(session_summaries_fts, rowid, request, investigated, learned, completed, next_steps, notes)
+          VALUES('delete', old.id, old.request, old.investigated, old.learned, old.completed, old.next_steps, old.notes);
+          INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
+          VALUES (new.id, new.request, new.investigated, new.learned, new.completed, new.next_steps, new.notes);
+        END;
+      `);
     }
   }
 
@@ -890,5 +895,337 @@ export class MigrationRunner {
 
     this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(24, new Date().toISOString());
     logger.debug('DB', 'Created observation_feedback table for usage tracking');
+  }
+
+  /**
+   * Add platform_source column to sdk_sessions for Claude/Codex isolation (migration 25)
+   */
+  private addSessionPlatformSourceColumn(): void {
+    const tableInfo = this.db.query('PRAGMA table_info(sdk_sessions)').all() as TableColumnInfo[];
+    const hasColumn = tableInfo.some(col => col.name === 'platform_source');
+    const indexInfo = this.db.query('PRAGMA index_list(sdk_sessions)').all() as IndexInfo[];
+    const hasIndex = indexInfo.some(index => index.name === 'idx_sdk_sessions_platform_source');
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(25) as SchemaVersion | undefined;
+
+    if (applied && hasColumn && hasIndex) return;
+
+    if (!hasColumn) {
+      this.db.run(`ALTER TABLE sdk_sessions ADD COLUMN platform_source TEXT NOT NULL DEFAULT '${DEFAULT_PLATFORM_SOURCE}'`);
+      logger.debug('DB', 'Added platform_source column to sdk_sessions table');
+    }
+
+    this.db.run(`
+      UPDATE sdk_sessions
+      SET platform_source = '${DEFAULT_PLATFORM_SOURCE}'
+      WHERE platform_source IS NULL OR platform_source = ''
+    `);
+
+    if (!hasIndex) {
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_sdk_sessions_platform_source ON sdk_sessions(platform_source)');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(25, new Date().toISOString());
+  }
+
+  /**
+   * Ensure merged_into_project columns + indices exist on observations and session_summaries.
+   *
+   * Self-idempotent via PRAGMA table_info guard — does NOT bump schema_versions.
+   * Supports merged-worktree adoption: a nullable pointer that lets a worktree's rows
+   * be surfaced under the parent project's observation list without data movement.
+   */
+  private ensureMergedIntoProjectColumns(): void {
+    const obsCols = this.db
+      .query('PRAGMA table_info(observations)')
+      .all() as TableColumnInfo[];
+    if (!obsCols.some(c => c.name === 'merged_into_project')) {
+      this.db.run('ALTER TABLE observations ADD COLUMN merged_into_project TEXT');
+    }
+    this.db.run(
+      'CREATE INDEX IF NOT EXISTS idx_observations_merged_into ON observations(merged_into_project)'
+    );
+
+    const sumCols = this.db
+      .query('PRAGMA table_info(session_summaries)')
+      .all() as TableColumnInfo[];
+    if (!sumCols.some(c => c.name === 'merged_into_project')) {
+      this.db.run('ALTER TABLE session_summaries ADD COLUMN merged_into_project TEXT');
+    }
+    this.db.run(
+      'CREATE INDEX IF NOT EXISTS idx_summaries_merged_into ON session_summaries(merged_into_project)'
+    );
+  }
+
+  /**
+   * Add agent_type and agent_id columns to observations and pending_messages (migration 27).
+   *
+   * Labels observation rows with the originating Claude Code subagent identity so
+   * downstream queries can distinguish main-session work from subagent work.
+   * Main-session rows keep NULL for both columns.
+   *
+   * Also threads the same columns through pending_messages so the label survives
+   * between enqueue (hook) and SDK-agent processing (which re-inserts into observations).
+   */
+  private addObservationSubagentColumns(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(27) as SchemaVersion | undefined;
+
+    const obsCols = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
+    const obsHasAgentType = obsCols.some(c => c.name === 'agent_type');
+    const obsHasAgentId = obsCols.some(c => c.name === 'agent_id');
+
+    if (!obsHasAgentType) {
+      this.db.run('ALTER TABLE observations ADD COLUMN agent_type TEXT');
+      logger.debug('DB', 'Added agent_type column to observations table');
+    }
+    if (!obsHasAgentId) {
+      this.db.run('ALTER TABLE observations ADD COLUMN agent_id TEXT');
+      logger.debug('DB', 'Added agent_id column to observations table');
+    }
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_observations_agent_type ON observations(agent_type)');
+    this.db.run('CREATE INDEX IF NOT EXISTS idx_observations_agent_id ON observations(agent_id)');
+
+    const pendingCols = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+    if (pendingCols.length > 0) {
+      const pendingHasAgentType = pendingCols.some(c => c.name === 'agent_type');
+      const pendingHasAgentId = pendingCols.some(c => c.name === 'agent_id');
+      if (!pendingHasAgentType) {
+        this.db.run('ALTER TABLE pending_messages ADD COLUMN agent_type TEXT');
+        logger.debug('DB', 'Added agent_type column to pending_messages table');
+      }
+      if (!pendingHasAgentId) {
+        this.db.run('ALTER TABLE pending_messages ADD COLUMN agent_id TEXT');
+        logger.debug('DB', 'Added agent_id column to pending_messages table');
+      }
+    }
+
+    if (!applied) {
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(27, new Date().toISOString());
+    }
+  }
+
+  /**
+   * Rebuild pending_messages for self-healing claim (migration 28).
+   *
+   * PATHFINDER-2026-04-22 Plan 01 Phase 2.
+   *
+   *  - Drops the legacy stale-reset epoch column (was the input to the
+   *    60-s stale-reset; replaced by worker-PID liveness at claim time).
+   *  - Adds `worker_pid INTEGER` (set by claimNextMessage to the live
+   *    worker's PID; rows whose worker_pid is no longer alive are
+   *    immediately reclaimable).
+   *  - Adds `tool_use_id TEXT` so ingestion-time pairing of tool_use →
+   *    tool_result can be DB-backed instead of an in-memory Map
+   *    (Plan 03 dependency).
+   *  - Dedupes any existing rows that share (content_session_id,
+   *    tool_use_id), then creates a partial UNIQUE index.
+   *
+   * Follows the table-rebuild precedent at runner.ts:691 (migration 21):
+   * disable FKs, BEGIN, recreate, INSERT-SELECT, RENAME, COMMIT, re-enable.
+   */
+  private rebuildPendingMessagesForSelfHealingClaim(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(28) as SchemaVersion | undefined;
+    if (applied) return;
+
+    const pendingExists = (this.db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_messages'").all() as TableNameRow[]).length > 0;
+    if (!pendingExists) {
+      // pending_messages table never created on this DB — nothing to rebuild.
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(28, new Date().toISOString());
+      return;
+    }
+
+    logger.debug('DB', 'Rebuilding pending_messages for self-healing claim (migration 28)');
+
+    // PRAGMA foreign_keys must be set outside a transaction.
+    this.db.run('PRAGMA foreign_keys = OFF');
+    this.db.run('BEGIN TRANSACTION');
+
+    try {
+      // Source columns may include legacy fields. We build the SELECT explicitly
+      // using only columns we know are present in the source after migration 27.
+      const sourceCols = this.db.query('PRAGMA table_info(pending_messages)').all() as TableColumnInfo[];
+      const colNames = new Set(sourceCols.map(c => c.name));
+      const has = (name: string) => colNames.has(name);
+
+      // Clean up leftover temp from a previously-crashed run.
+      this.db.run('DROP TABLE IF EXISTS pending_messages_new');
+
+      this.db.run(`
+        CREATE TABLE pending_messages_new (
+          id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_db_id            INTEGER NOT NULL,
+          content_session_id       TEXT    NOT NULL,
+          tool_use_id              TEXT,
+          message_type             TEXT    NOT NULL CHECK(message_type IN ('observation', 'summarize')),
+          tool_name                TEXT,
+          tool_input               TEXT,
+          tool_response            TEXT,
+          cwd                      TEXT,
+          last_user_message        TEXT,
+          last_assistant_message   TEXT,
+          prompt_number            INTEGER,
+          status                   TEXT    NOT NULL DEFAULT 'pending'
+                                           CHECK(status IN ('pending', 'processing', 'processed', 'failed')),
+          retry_count              INTEGER NOT NULL DEFAULT 0,
+          created_at_epoch         INTEGER NOT NULL,
+          failed_at_epoch          INTEGER,
+          completed_at_epoch       INTEGER,
+          worker_pid               INTEGER,
+          agent_type               TEXT,
+          agent_id                 TEXT,
+          FOREIGN KEY (session_db_id) REFERENCES sdk_sessions(id) ON DELETE CASCADE
+        )
+      `);
+
+      // INSERT-SELECT — note that the legacy stale-reset epoch column is
+      // intentionally omitted. Any 'processing' row is left with worker_pid =
+      // NULL so that a self-healing claim picks it up immediately on next
+      // worker boot.
+      this.db.run(`
+        INSERT INTO pending_messages_new (
+          id, session_db_id, content_session_id, tool_use_id, message_type,
+          tool_name, tool_input, tool_response, cwd, last_user_message,
+          last_assistant_message, prompt_number, status, retry_count,
+          created_at_epoch, failed_at_epoch, completed_at_epoch, worker_pid,
+          agent_type, agent_id
+        )
+        SELECT
+          id,
+          session_db_id,
+          content_session_id,
+          ${has('tool_use_id') ? 'tool_use_id' : 'NULL'},
+          message_type,
+          tool_name,
+          tool_input,
+          tool_response,
+          cwd,
+          ${has('last_user_message') ? 'last_user_message' : 'NULL'},
+          ${has('last_assistant_message') ? 'last_assistant_message' : 'NULL'},
+          ${has('prompt_number') ? 'prompt_number' : 'NULL'},
+          status,
+          retry_count,
+          created_at_epoch,
+          ${has('failed_at_epoch') ? 'failed_at_epoch' : 'NULL'},
+          ${has('completed_at_epoch') ? 'completed_at_epoch' : 'NULL'},
+          NULL,
+          ${has('agent_type') ? 'agent_type' : 'NULL'},
+          ${has('agent_id') ? 'agent_id' : 'NULL'}
+        FROM pending_messages
+      `);
+
+      this.db.run('DROP TABLE pending_messages');
+      this.db.run('ALTER TABLE pending_messages_new RENAME TO pending_messages');
+
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_session        ON pending_messages(session_db_id)');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_status         ON pending_messages(status)');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_claude_session ON pending_messages(content_session_id)');
+      this.db.run('CREATE INDEX IF NOT EXISTS idx_pending_messages_worker_pid     ON pending_messages(worker_pid)');
+
+      // Dedup any pre-existing duplicate (content_session_id, tool_use_id) pairs
+      // before adding the UNIQUE index. Keep the lowest id (oldest) per pair.
+      this.db.run(`
+        DELETE FROM pending_messages
+         WHERE tool_use_id IS NOT NULL
+           AND id NOT IN (
+             SELECT MIN(id) FROM pending_messages
+              WHERE tool_use_id IS NOT NULL
+              GROUP BY content_session_id, tool_use_id
+           )
+      `);
+
+      this.db.run(`
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_session_tool
+        ON pending_messages(content_session_id, tool_use_id)
+        WHERE tool_use_id IS NOT NULL
+      `);
+
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(28, new Date().toISOString());
+      this.db.run('COMMIT');
+      this.db.run('PRAGMA foreign_keys = ON');
+
+      logger.debug('DB', 'Rebuilt pending_messages for self-healing claim');
+    } catch (error) {
+      this.db.run('ROLLBACK');
+      this.db.run('PRAGMA foreign_keys = ON');
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(`Migration 28 failed: ${String(error)}`);
+    }
+  }
+
+  /**
+   * Add UNIQUE(memory_session_id, content_hash) on observations (migration 29).
+   *
+   * PATHFINDER-2026-04-22 Plan 01 Phase 2 + Phase 4.
+   *
+   *  - Dedupes existing rows that share (memory_session_id, content_hash),
+   *    keeping the lowest id (oldest) per pair.
+   *  - Creates a UNIQUE index that lets writers use
+   *    INSERT … ON CONFLICT(memory_session_id, content_hash) DO NOTHING
+   *    in place of the legacy dedup window scan.
+   */
+  private addObservationsUniqueContentHashIndex(): void {
+    const applied = this.db.prepare('SELECT version FROM schema_versions WHERE version = ?').get(29) as SchemaVersion | undefined;
+    if (applied) return;
+
+    // Need both columns to exist.
+    const obsCols = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
+    const hasMem = obsCols.some(c => c.name === 'memory_session_id');
+    const hasHash = obsCols.some(c => c.name === 'content_hash');
+    if (!hasMem || !hasHash) {
+      // Nothing to do; record so we don't keep retrying.
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(29, new Date().toISOString());
+      return;
+    }
+
+    this.db.run('BEGIN TRANSACTION');
+    try {
+      // Dedup before adding the UNIQUE index — keep the lowest id per pair.
+      this.db.run(`
+        DELETE FROM observations
+         WHERE id NOT IN (
+           SELECT MIN(id) FROM observations
+            GROUP BY memory_session_id, content_hash
+         )
+      `);
+
+      this.db.run(`
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_observations_session_hash
+        ON observations(memory_session_id, content_hash)
+      `);
+
+      this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(29, new Date().toISOString());
+      this.db.run('COMMIT');
+      logger.debug('DB', 'Added UNIQUE(memory_session_id, content_hash) on observations');
+    } catch (error) {
+      this.db.run('ROLLBACK');
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(`Migration 29 failed: ${String(error)}`);
+    }
+  }
+
+  /**
+   * Add metadata TEXT column to observations (migration 30).
+   *
+   * Backward-compatible: nullable, no default. Holds JSON-encoded arbitrary
+   * metadata supplied by callers of POST /api/memory/save (#2116). Without
+   * this column, the route's Zod `.passthrough()` accepted unknown fields
+   * but the INSERT silently dropped them — a quiet contract violation.
+   *
+   * Idempotent via PRAGMA table_info guard so cross-machine DB sync that
+   * leaves schema_versions ahead of actual schema still self-heals.
+   */
+  private addObservationsMetadataColumn(): void {
+    const cols = this.db.query('PRAGMA table_info(observations)').all() as TableColumnInfo[];
+    const hasColumn = cols.some(c => c.name === 'metadata');
+
+    if (!hasColumn) {
+      this.db.run('ALTER TABLE observations ADD COLUMN metadata TEXT');
+      logger.debug('DB', 'Added metadata column to observations table (#2116)');
+    }
+
+    this.db.prepare('INSERT OR IGNORE INTO schema_versions (version, applied_at) VALUES (?, ?)').run(30, new Date().toISOString());
   }
 }

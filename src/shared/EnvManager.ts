@@ -9,7 +9,7 @@
  * causing memory operations to bill personal API accounts instead of CLI subscription.
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync } from 'fs';
 import { join, dirname } from 'path';
 import { homedir } from 'os';
 import { logger } from '../utils/logger.js';
@@ -30,16 +30,10 @@ const BLOCKED_ENV_VARS = [
   'CLAUDECODE',         // Prevent "cannot be launched inside another Claude Code session" error
 ];
 
-// Credential keys that claude-mem manages
-export const MANAGED_CREDENTIAL_KEYS = [
-  'ANTHROPIC_API_KEY',
-  'GEMINI_API_KEY',
-  'OPENROUTER_API_KEY',
-];
-
 export interface ClaudeMemEnv {
   // Credentials (optional - empty means use CLI billing for Claude)
   ANTHROPIC_API_KEY?: string;
+  ANTHROPIC_BASE_URL?: string;
   GEMINI_API_KEY?: string;
   OPENROUTER_API_KEY?: string;
 }
@@ -115,12 +109,13 @@ export function loadClaudeMemEnv(): ClaudeMemEnv {
     // Only return managed credential keys
     const result: ClaudeMemEnv = {};
     if (parsed.ANTHROPIC_API_KEY) result.ANTHROPIC_API_KEY = parsed.ANTHROPIC_API_KEY;
+    if (parsed.ANTHROPIC_BASE_URL) result.ANTHROPIC_BASE_URL = parsed.ANTHROPIC_BASE_URL;
     if (parsed.GEMINI_API_KEY) result.GEMINI_API_KEY = parsed.GEMINI_API_KEY;
     if (parsed.OPENROUTER_API_KEY) result.OPENROUTER_API_KEY = parsed.OPENROUTER_API_KEY;
 
     return result;
-  } catch (error) {
-    logger.warn('ENV', 'Failed to load .env file', { path: ENV_FILE_PATH }, error as Error);
+  } catch (error: unknown) {
+    logger.warn('ENV', 'Failed to load .env file', { path: ENV_FILE_PATH }, error instanceof Error ? error : new Error(String(error)));
     return {};
   }
 }
@@ -129,46 +124,67 @@ export function loadClaudeMemEnv(): ClaudeMemEnv {
  * Save credentials to ~/.claude-mem/.env
  */
 export function saveClaudeMemEnv(env: ClaudeMemEnv): void {
+  let existing: Record<string, string> = {};
   try {
-    // Ensure directory exists
+    // Ensure directory exists with restricted permissions (owner only)
     if (!existsSync(DATA_DIR)) {
-      mkdirSync(DATA_DIR, { recursive: true });
+      mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
     }
+    // Fix permissions on pre-existing directories (mode: is only applied on creation)
+    // Note: On Windows, chmod has no effect — permissions are controlled via ACLs.
+    chmodSync(DATA_DIR, 0o700);
 
     // Load existing to preserve any extra keys
-    const existing = existsSync(ENV_FILE_PATH)
+    existing = existsSync(ENV_FILE_PATH)
       ? parseEnvFile(readFileSync(ENV_FILE_PATH, 'utf-8'))
       : {};
-
-    // Update with new values
-    const updated: Record<string, string> = { ...existing };
-
-    // Only update managed keys
-    if (env.ANTHROPIC_API_KEY !== undefined) {
-      if (env.ANTHROPIC_API_KEY) {
-        updated.ANTHROPIC_API_KEY = env.ANTHROPIC_API_KEY;
-      } else {
-        delete updated.ANTHROPIC_API_KEY;
-      }
-    }
-    if (env.GEMINI_API_KEY !== undefined) {
-      if (env.GEMINI_API_KEY) {
-        updated.GEMINI_API_KEY = env.GEMINI_API_KEY;
-      } else {
-        delete updated.GEMINI_API_KEY;
-      }
-    }
-    if (env.OPENROUTER_API_KEY !== undefined) {
-      if (env.OPENROUTER_API_KEY) {
-        updated.OPENROUTER_API_KEY = env.OPENROUTER_API_KEY;
-      } else {
-        delete updated.OPENROUTER_API_KEY;
-      }
-    }
-
-    writeFileSync(ENV_FILE_PATH, serializeEnvFile(updated), 'utf-8');
   } catch (error) {
-    logger.error('ENV', 'Failed to save .env file', { path: ENV_FILE_PATH }, error as Error);
+    const normalizedError = error instanceof Error ? error : new Error(String(error));
+    logger.error('ENV', 'Failed to set up env directory or read existing env', {}, normalizedError);
+    throw normalizedError;
+  }
+
+  // Update with new values
+  const updated: Record<string, string> = { ...existing };
+
+  // Only update managed keys
+  if (env.ANTHROPIC_API_KEY !== undefined) {
+    if (env.ANTHROPIC_API_KEY) {
+      updated.ANTHROPIC_API_KEY = env.ANTHROPIC_API_KEY;
+    } else {
+      delete updated.ANTHROPIC_API_KEY;
+    }
+  }
+  if (env.ANTHROPIC_BASE_URL !== undefined) {
+    if (env.ANTHROPIC_BASE_URL) {
+      updated.ANTHROPIC_BASE_URL = env.ANTHROPIC_BASE_URL;
+    } else {
+      delete updated.ANTHROPIC_BASE_URL;
+    }
+  }
+  if (env.GEMINI_API_KEY !== undefined) {
+    if (env.GEMINI_API_KEY) {
+      updated.GEMINI_API_KEY = env.GEMINI_API_KEY;
+    } else {
+      delete updated.GEMINI_API_KEY;
+    }
+  }
+  if (env.OPENROUTER_API_KEY !== undefined) {
+    if (env.OPENROUTER_API_KEY) {
+      updated.OPENROUTER_API_KEY = env.OPENROUTER_API_KEY;
+    } else {
+      delete updated.OPENROUTER_API_KEY;
+    }
+  }
+
+  try {
+    writeFileSync(ENV_FILE_PATH, serializeEnvFile(updated), { encoding: 'utf-8', mode: 0o600 });
+    // Explicitly set permissions in case the file already existed before this fix.
+    // writeFileSync's mode option only applies on file creation (O_CREAT), not on overwrites.
+    // Note: On Windows, chmod has no effect — permissions are controlled via ACLs.
+    chmodSync(ENV_FILE_PATH, 0o600);
+  } catch (error: unknown) {
+    logger.error('ENV', 'Failed to save .env file', { path: ENV_FILE_PATH }, error instanceof Error ? error : new Error(String(error)));
     throw error;
   }
 }
@@ -201,6 +217,13 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
   // 2. Override SDK entrypoint marker
   isolatedEnv.CLAUDE_CODE_ENTRYPOINT = 'sdk-ts';
 
+  // 2a. Mark this as an internal claude-mem subprocess so spawned hooks can
+  // skip tracking unconditionally. This is the single trust boundary for
+  // observer-session detection — every consumer can check
+  // process.env.CLAUDE_MEM_INTERNAL instead of repeating cwd-based exclusion
+  // checks (which inevitably drift; see #2118 / #2126).
+  isolatedEnv.CLAUDE_MEM_INTERNAL = '1';
+
   // 3. Re-inject managed credentials from claude-mem's .env file
   if (includeCredentials) {
     const credentials = loadClaudeMemEnv();
@@ -209,6 +232,12 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
     // If not configured, CLI billing will be used (via ANTHROPIC_AUTH_TOKEN passthrough)
     if (credentials.ANTHROPIC_API_KEY) {
       isolatedEnv.ANTHROPIC_API_KEY = credentials.ANTHROPIC_API_KEY;
+    }
+    // Override ANTHROPIC_BASE_URL from .env if configured
+    // This ensures the SDK subprocess uses a stable API endpoint instead of
+    // inheriting a dynamic local proxy port that may become stale
+    if (credentials.ANTHROPIC_BASE_URL) {
+      isolatedEnv.ANTHROPIC_BASE_URL = credentials.ANTHROPIC_BASE_URL;
     }
     // Note: GEMINI_API_KEY and OPENROUTER_API_KEY pass through from process.env,
     // but claude-mem's .env takes precedence if configured
@@ -238,16 +267,6 @@ export function buildIsolatedEnv(includeCredentials: boolean = true): Record<str
 export function getCredential(key: keyof ClaudeMemEnv): string | undefined {
   const env = loadClaudeMemEnv();
   return env[key];
-}
-
-/**
- * Set a specific credential in claude-mem's .env
- * Pass empty string to remove the credential
- */
-export function setCredential(key: keyof ClaudeMemEnv, value: string): void {
-  const env = loadClaudeMemEnv();
-  env[key] = value || undefined;
-  saveClaudeMemEnv(env);
 }
 
 /**

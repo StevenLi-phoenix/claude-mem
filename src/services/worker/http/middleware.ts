@@ -21,8 +21,8 @@ export function createMiddleware(
 ): RequestHandler[] {
   const middlewares: RequestHandler[] = [];
 
-  // JSON parsing with 50mb limit
-  middlewares.push(express.json({ limit: '50mb' }));
+  // JSON parsing with 5mb limit (#1935)
+  middlewares.push(express.json({ limit: '5mb' }));
 
   // CORS - restrict to localhost origins only
   middlewares.push(cors({
@@ -38,7 +38,7 @@ export function createMiddleware(
       }
     },
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    allowedHeaders: ['Content-Type', 'X-Requested-With'],
     credentials: false
   }));
 

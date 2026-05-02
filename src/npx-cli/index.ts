@@ -52,6 +52,8 @@ ${pc.bold('Runtime Commands')} (requires Bun, delegates to installed plugin):
   ${pc.cyan('npx claude-mem restart')}              Restart worker service
   ${pc.cyan('npx claude-mem status')}               Show worker status
   ${pc.cyan('npx claude-mem search <query>')}       Search observations
+  ${pc.cyan('npx claude-mem adopt [--dry-run] [--branch <name>]')}    Stamp merged worktrees into parent project
+  ${pc.cyan('npx claude-mem cleanup [--dry-run]')}    Run one-time v12.4.3 pollution cleanup (or preview counts)
   ${pc.cyan('npx claude-mem transcript watch')}     Start transcript watcher
 
 ${pc.bold('IDE Identifiers')}:
@@ -142,6 +144,20 @@ async function main(): Promise<void> {
     case 'search': {
       const { runSearchCommand } = await import('./commands/runtime.js');
       await runSearchCommand(args.slice(1));
+      break;
+    }
+
+    // -- Adopt merged worktrees -------------------------------------------
+    case 'adopt': {
+      const { runAdoptCommand } = await import('./commands/runtime.js');
+      runAdoptCommand(args.slice(1));
+      break;
+    }
+
+    // -- One-time v12.4.3 cleanup ------------------------------------------
+    case 'cleanup': {
+      const { runCleanupCommand } = await import('./commands/runtime.js');
+      runCleanupCommand(args.slice(1));
       break;
     }
 

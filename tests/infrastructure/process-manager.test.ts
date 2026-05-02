@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'fs';
+import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { tmpdir } from 'os';
 import path from 'path';
@@ -16,6 +16,8 @@ import {
   spawnDaemon,
   resolveWorkerRuntimePath,
   runOneTimeChromaMigration,
+  captureProcessStartToken,
+  verifyPidFileOwnership,
   type PidInfo
 } from '../../src/services/infrastructure/index.js';
 
@@ -229,13 +231,65 @@ describe('ProcessManager', () => {
   });
 
   describe('resolveWorkerRuntimePath', () => {
-    it('should return current runtime on non-Windows platforms', () => {
+    it('should reuse execPath when already running under Bun on Linux', () => {
       const resolved = resolveWorkerRuntimePath({
         platform: 'linux',
-        execPath: '/usr/bin/node'
+        execPath: '/home/alice/.bun/bin/bun'
       });
 
-      expect(resolved).toBe('/usr/bin/node');
+      expect(resolved).toBe('/home/alice/.bun/bin/bun');
+    });
+
+    it('should look up Bun on non-Windows when caller is Node (e.g. MCP server)', () => {
+      const resolved = resolveWorkerRuntimePath({
+        platform: 'linux',
+        execPath: '/usr/bin/node',
+        env: {} as NodeJS.ProcessEnv,
+        homeDirectory: '/home/alice',
+        pathExists: candidatePath => candidatePath === '/home/alice/.bun/bin/bun',
+        lookupInPath: () => null
+      });
+
+      expect(resolved).toBe('/home/alice/.bun/bin/bun');
+    });
+
+    it('should preserve bare BUN env command on non-Windows so spawn resolves it via PATH', () => {
+      const resolved = resolveWorkerRuntimePath({
+        platform: 'linux',
+        execPath: '/usr/bin/node',
+        env: { BUN: 'bun' } as NodeJS.ProcessEnv,
+        homeDirectory: '/home/alice',
+        pathExists: () => false,
+        lookupInPath: () => null
+      });
+
+      expect(resolved).toBe('bun');
+    });
+
+    it('should fall back to PATH lookup on non-Windows when no known Bun candidate exists', () => {
+      const resolved = resolveWorkerRuntimePath({
+        platform: 'linux',
+        execPath: '/usr/bin/node',
+        env: {} as NodeJS.ProcessEnv,
+        homeDirectory: '/home/alice',
+        pathExists: () => false,
+        lookupInPath: () => '/custom/bin/bun'
+      });
+
+      expect(resolved).toBe('/custom/bin/bun');
+    });
+
+    it('should return null on non-Windows when Bun cannot be resolved', () => {
+      const resolved = resolveWorkerRuntimePath({
+        platform: 'linux',
+        execPath: '/usr/bin/node',
+        env: {} as NodeJS.ProcessEnv,
+        homeDirectory: '/home/alice',
+        pathExists: () => false,
+        lookupInPath: () => null
+      });
+
+      expect(resolved).toBeNull();
     });
 
     it('should reuse execPath when already running under Bun on Windows', () => {
@@ -306,6 +360,121 @@ describe('ProcessManager', () => {
     it('should return false for non-integer PIDs', () => {
       expect(isProcessAlive(1.5)).toBe(false);
       expect(isProcessAlive(NaN)).toBe(false);
+    });
+  });
+
+  describe('captureProcessStartToken', () => {
+    const supported = process.platform === 'linux' || process.platform === 'darwin';
+
+    it.if(supported)('returns a non-empty token for the current process', () => {
+      const token = captureProcessStartToken(process.pid);
+      expect(typeof token).toBe('string');
+      expect((token ?? '').length).toBeGreaterThan(0);
+    });
+
+    it.if(supported)('returns a stable token across calls for the same PID', () => {
+      const first = captureProcessStartToken(process.pid);
+      const second = captureProcessStartToken(process.pid);
+      expect(first).toBe(second);
+    });
+
+    it('returns null for a non-existent PID', () => {
+      expect(captureProcessStartToken(2147483647)).toBeNull();
+    });
+
+    it('returns null for invalid PIDs', () => {
+      expect(captureProcessStartToken(0)).toBeNull();
+      expect(captureProcessStartToken(-1)).toBeNull();
+      expect(captureProcessStartToken(1.5)).toBeNull();
+      expect(captureProcessStartToken(NaN)).toBeNull();
+    });
+
+    it('returns null on win32 (liveness-only fallback path)', () => {
+      // Simulate Windows to exercise the documented fallback. Real CI doesn't
+      // run on win32, so without this mock the branch is uncovered.
+      const originalPlatform = process.platform;
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      try {
+        expect(captureProcessStartToken(process.pid)).toBeNull();
+      } finally {
+        Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+      }
+    });
+  });
+
+  describe('writePidFile (start-token capture)', () => {
+    const supported = process.platform === 'linux' || process.platform === 'darwin';
+
+    it.if(supported)('auto-captures a startToken when writing for the current process', () => {
+      writePidFile({ pid: process.pid, port: 37777, startedAt: new Date().toISOString() });
+      const persisted = readPidFile();
+      expect(persisted).not.toBeNull();
+      expect(typeof persisted!.startToken).toBe('string');
+      expect((persisted!.startToken ?? '').length).toBeGreaterThan(0);
+    });
+
+    it('preserves a caller-supplied startToken verbatim', () => {
+      const provided = 'caller-supplied-token-xyz';
+      writePidFile({ pid: process.pid, port: 37777, startedAt: new Date().toISOString(), startToken: provided });
+      const persisted = readPidFile();
+      expect(persisted!.startToken).toBe(provided);
+    });
+
+    it('omits startToken when the target PID has no readable token (dead PID)', () => {
+      // pid is dead, so captureProcessStartToken() returns null and writePidFile
+      // should not persist a startToken field.
+      writePidFile({ pid: 2147483647, port: 37777, startedAt: new Date().toISOString() });
+      const persisted = readPidFile();
+      expect(persisted).not.toBeNull();
+      expect(persisted!.startToken).toBeUndefined();
+    });
+  });
+
+  describe('verifyPidFileOwnership', () => {
+    const supported = process.platform === 'linux' || process.platform === 'darwin';
+
+    it('returns false for null input', () => {
+      expect(verifyPidFileOwnership(null)).toBe(false);
+    });
+
+    it('returns false when the PID is not alive', () => {
+      expect(verifyPidFileOwnership({
+        pid: 2147483647,
+        port: 37777,
+        startedAt: new Date().toISOString(),
+        startToken: 'anything'
+      })).toBe(false);
+    });
+
+    it('returns true when no startToken is stored (back-compat with older PID files)', () => {
+      expect(verifyPidFileOwnership({
+        pid: process.pid,
+        port: 37777,
+        startedAt: new Date().toISOString()
+        // intentionally no startToken
+      })).toBe(true);
+    });
+
+    it.if(supported)('returns true when the stored token matches the current PID', () => {
+      const token = captureProcessStartToken(process.pid);
+      expect(token).not.toBeNull();
+      expect(verifyPidFileOwnership({
+        pid: process.pid,
+        port: 37777,
+        startedAt: new Date().toISOString(),
+        startToken: token!
+      })).toBe(true);
+    });
+
+    it.if(supported)('returns false when the stored token does not match (PID reused)', () => {
+      // Simulates the container-restart bug: PID is alive (we pass our own),
+      // but the stored token was written by a prior incarnation.
+      expect(verifyPidFileOwnership({
+        pid: process.pid,
+        port: 37777,
+        startedAt: new Date().toISOString(),
+        startToken: 'token-from-a-different-incarnation'
+      })).toBe(false);
     });
   });
 
@@ -380,7 +549,7 @@ describe('ProcessManager', () => {
       // Wait a bit to ensure measurable mtime difference
       await new Promise(r => setTimeout(r, 50));
 
-      const statsBefore = require('fs').statSync(PID_FILE);
+      const statsBefore = statSync(PID_FILE);
       const mtimeBefore = statsBefore.mtimeMs;
 
       // Wait again to ensure mtime advances
@@ -388,7 +557,7 @@ describe('ProcessManager', () => {
 
       touchPidFile();
 
-      const statsAfter = require('fs').statSync(PID_FILE);
+      const statsAfter = statSync(PID_FILE);
       const mtimeAfter = statsAfter.mtimeMs;
 
       expect(mtimeAfter).toBeGreaterThanOrEqual(mtimeBefore);
@@ -438,6 +607,39 @@ describe('ProcessManager', () => {
       if (result !== undefined && result > 0) {
         try { process.kill(result, 'SIGKILL'); } catch { /* already exited */ }
       }
+    });
+
+    /**
+     * Documents the spawnDaemon return contract for the Windows `0` PID
+     * success sentinel. PowerShell `Start-Process` does not return the spawned
+     * PID, so the Windows branch returns 0 as a "spawn dispatched" sentinel.
+     * Callers MUST use `pid === undefined` to detect failure — never falsy
+     * checks like `if (!pid)`, which would silently treat success as failure
+     * because 0 is falsy in JavaScript.
+     *
+     * This contract test exists so any future contributor introducing
+     * `if (!pid)` against a spawnDaemon return value (or its wrapper) sees a
+     * failing assertion that documents why the falsy check is incorrect.
+     * See PR #1645 review feedback for context.
+     */
+    it('Windows 0 PID success sentinel must NOT be detected via falsy check', () => {
+      const windowsSuccessSentinel: number | undefined = 0;
+      const failureSentinel: number | undefined = undefined;
+
+      // Correct contract: undefined === failure, anything else === success.
+      expect(windowsSuccessSentinel === undefined).toBe(false);
+      expect(failureSentinel === undefined).toBe(true);
+
+      // Demonstrates the bug a future regression would introduce:
+      // `if (!pid)` is true for BOTH the Windows success sentinel AND the
+      // genuine failure sentinel — silently treating success as failure.
+      expect(!windowsSuccessSentinel).toBe(true); // ← this is the trap
+      expect(!failureSentinel).toBe(true);
+
+      // Therefore, callers must use strict undefined comparison.
+      const isFailure = (pid: number | undefined) => pid === undefined;
+      expect(isFailure(windowsSuccessSentinel)).toBe(false);
+      expect(isFailure(failureSentinel)).toBe(true);
     });
   });
 

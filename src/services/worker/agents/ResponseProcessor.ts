@@ -12,8 +12,10 @@
  */
 
 import { logger } from '../../../utils/logger.js';
-import { parseObservations, parseSummary, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
+import { parseAgentXml, type ParsedObservation, type ParsedSummary } from '../../../sdk/parser.js';
+import { ingestSummary } from '../http/shared.js';
 import { updateCursorContextForProject } from '../../integrations/CursorHooksInstaller.js';
+import { notifyTelegram } from '../../integrations/TelegramNotifier.js';
 import { updateFolderClaudeMdFiles } from '../../../utils/claude-md-utils.js';
 import { getWorkerPort } from '../../../shared/worker-utils.js';
 import { SettingsDefaultsManager } from '../../../shared/SettingsDefaultsManager.js';
@@ -54,7 +56,8 @@ export async function processAgentResponse(
   discoveryTokens: number,
   originalTimestamp: number | null,
   agentName: string,
-  projectRoot?: string
+  projectRoot?: string,
+  modelId?: string
 ): Promise<void> {
   // Track generator activity for stale detection (Issue #1099)
   session.lastGeneratorActivity = Date.now();
@@ -64,21 +67,33 @@ export async function processAgentResponse(
     session.conversationHistory.push({ role: 'assistant', content: text });
   }
 
-  // Parse observations and summary
-  const observations = parseObservations(text, session.contentSessionId);
-  const summary = parseSummary(text, session.sessionDbId);
+  // Single fail-fast parse (PATHFINDER plan 03 phase 1+2). On invalid XML,
+  // mark each in-flight pending message failed and stop. The PendingMessageStore
+  // retry ladder is the legitimate primary-path surface for transient failures;
+  // there is no circuit breaker, no coercion.
+  const parsed = parseAgentXml(text, session.contentSessionId);
 
-  if (
-    text.trim() &&
-    observations.length === 0 &&
-    !summary &&
-    !/<observation>|<summary>|<skip_summary\b/.test(text)
-  ) {
-    const preview = text.length > 200 ? `${text.slice(0, 200)}...` : text;
-    logger.warn('PARSER', `${agentName} returned non-XML response; observation content was discarded`, {
+  if (!parsed.valid) {
+    logger.warn('PARSER', `${agentName} returned unparseable response: ${parsed.reason}`, {
       sessionId: session.sessionDbId,
-      preview
     });
+    const pendingStore = sessionManager.getPendingMessageStore();
+    for (const messageId of session.processingMessageIds) {
+      pendingStore.markFailed(messageId);
+    }
+    session.processingMessageIds = [];
+    return;
+  }
+
+  let observations: ParsedObservation[] = [];
+  let summary: ParsedSummary | null = null;
+  if (parsed.kind === 'observation') {
+    observations = parsed.data;
+  } else if (!parsed.data.skipped) {
+    // `<skip_summary/>` is a first-class parser result but carries nothing to
+    // persist; the summary storage path is skipped entirely so storeObservations
+    // does not see an empty record.
+    summary = parsed.data;
   }
 
   // Convert nullable fields to empty strings for storeSummary (if summary exists)
@@ -106,23 +121,65 @@ export async function processAgentResponse(
     memorySessionId: session.memorySessionId
   });
 
+  // Label observations with the subagent identity captured from the claimed messages.
+  // Main-session messages leave these null, so main-session rows stay NULL in the DB.
+  const labeledObservations = observations.map(obs => ({
+    ...obs,
+    agent_type: session.pendingAgentType ?? null,
+    agent_id: session.pendingAgentId ?? null
+  }));
+
   // ATOMIC TRANSACTION: Store observations + summary ONCE
-  // Messages are already deleted from queue on claim, so no completion tracking needed
-  const result = sessionStore.storeObservations(
-    session.memorySessionId,
-    session.project,
-    observations,
-    summaryForStore,
-    session.lastPromptNumber,
-    discoveryTokens,
-    originalTimestamp ?? undefined
-  );
+  // Messages are already deleted from queue on claim, so no completion tracking needed.
+  // Wrap in try/finally so the subagent tracker clears even if storage throws —
+  // otherwise stale identity could leak into the next batch and mislabel rows.
+  // Expected invariant: all observations in a batch share the same agent context,
+  // because ResponseProcessor runs after a single agent-response cycle.
+  let result: ReturnType<typeof sessionStore.storeObservations>;
+  try {
+    result = sessionStore.storeObservations(
+      session.memorySessionId,
+      session.project,
+      labeledObservations,
+      summaryForStore,
+      session.lastPromptNumber,
+      discoveryTokens,
+      originalTimestamp ?? undefined,
+      modelId
+    );
+  } finally {
+    session.pendingAgentId = null;
+    session.pendingAgentType = null;
+  }
 
   // Log storage result with IDs for end-to-end traceability
   logger.info('DB', `STORED | sessionDbId=${session.sessionDbId} | memorySessionId=${session.memorySessionId} | obsCount=${result.observationIds.length} | obsIds=[${result.observationIds.join(',')}] | summaryId=${result.summaryId || 'none'}`, {
     sessionId: session.sessionDbId,
     memorySessionId: session.memorySessionId
   });
+
+  // Track whether a summary record was stored so the status endpoint can expose this
+  // to the Stop hook for silent-summary-loss detection (#1633)
+  session.lastSummaryStored = result.summaryId !== null;
+
+  // Gate ingestSummary({kind:'parsed'}) on real persistence so the event bus
+  // only fires for summaries that actually landed in the DB. Skipped summaries
+  // (<skip_summary/>) are an explicit bypass and still notify.
+  if (parsed.kind === 'summary' && (parsed.data.skipped || session.lastSummaryStored)) {
+    const messageId = session.processingMessageIds[0] ?? -1;
+    ingestSummary({
+      kind: 'parsed',
+      sessionDbId: session.sessionDbId,
+      messageId,
+      contentSessionId: session.contentSessionId,
+      parsed: parsed.data,
+    });
+  } else if (parsed.kind === 'summary') {
+    logger.warn('DB', 'summary parsed but no row persisted; suppressing summaryStoredEvent', {
+      sessionId: session.sessionDbId,
+      memorySessionId: session.memorySessionId,
+    });
+  }
 
   // CLAIM-CONFIRM: Now that storage succeeded, confirm all processing messages (delete from queue)
   // This is the critical step that prevents message loss on generator crash
@@ -132,9 +189,18 @@ export async function processAgentResponse(
   }
   if (session.processingMessageIds.length > 0) {
     logger.debug('QUEUE', `CONFIRMED_BATCH | sessionDbId=${session.sessionDbId} | count=${session.processingMessageIds.length} | ids=[${session.processingMessageIds.join(',')}]`);
+    // Record successful processing so restart guard decay is anchored to real successes
+    session.restartGuard?.recordSuccess();
   }
   // Clear the tracking array after confirmation
   session.processingMessageIds = [];
+
+  void notifyTelegram({
+    observations: labeledObservations,
+    observationIds: result.observationIds,
+    project: session.project,
+    memorySessionId: session.memorySessionId,
+  });
 
   // AFTER transaction commits - async operations (can fail safely without data loss)
   await syncAndBroadcastObservations(
@@ -236,6 +302,7 @@ async function syncAndBroadcastObservations(
       id: obsId,
       memory_session_id: session.memorySessionId,
       session_id: session.contentSessionId,
+      platform_source: session.platformSource,
       type: obs.type,
       title: obs.title,
       subtitle: obs.subtitle,
@@ -256,7 +323,7 @@ async function syncAndBroadcastObservations(
   // Only runs if CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED is true (default: false)
   const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
   // Handle both string 'true' and boolean true from JSON settings
-  const settingValue = settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED;
+  const settingValue: unknown = settings.CLAUDE_MEM_FOLDER_CLAUDEMD_ENABLED;
   const folderClaudeMdEnabled = settingValue === 'true' || settingValue === true;
 
   if (folderClaudeMdEnabled) {
@@ -325,12 +392,13 @@ async function syncAndBroadcastSummary(
   broadcastSummary(worker, {
     id: result.summaryId,
     session_id: session.contentSessionId,
-    request: summary!.request,
-    investigated: summary!.investigated,
-    learned: summary!.learned,
-    completed: summary!.completed,
-    next_steps: summary!.next_steps,
-    notes: summary!.notes,
+    platform_source: session.platformSource,
+    request: summaryForStore!.request,
+    investigated: summaryForStore!.investigated,
+    learned: summaryForStore!.learned,
+    completed: summaryForStore!.completed,
+    next_steps: summaryForStore!.next_steps,
+    notes: summaryForStore!.notes,
     project: session.project,
     prompt_number: session.lastPromptNumber,
     created_at_epoch: result.createdAtEpoch

@@ -12,7 +12,8 @@
 
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { parseFilesBatch, formatFoldedView, type FoldedFile } from "./parser.js";
+import { parseFilesBatch, formatFoldedView, loadUserGrammars, type FoldedFile } from "./parser.js";
+import { logger } from "../../utils/logger.js";
 
 const CODE_EXTENSIONS = new Set([
   ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
@@ -22,11 +23,22 @@ const CODE_EXTENSIONS = new Set([
   ".rb",
   ".java",
   ".cs",
-  ".cpp", ".c", ".h", ".hpp",
+  ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".hh",
   ".swift",
-  ".kt",
+  ".kt", ".kts",
   ".php",
   ".vue", ".svelte",
+  ".ex", ".exs",
+  ".lua",
+  ".scala", ".sc",
+  ".sh", ".bash", ".zsh",
+  ".hs",
+  ".zig",
+  ".css", ".scss",
+  ".toml",
+  ".yml", ".yaml",
+  ".sql",
+  ".md", ".mdx",
 ]);
 
 const IGNORE_DIRS = new Set([
@@ -59,14 +71,16 @@ export interface SymbolMatch {
 
 /**
  * Walk a directory recursively, yielding file paths.
+ * extraExtensions: additional file extensions to include (from user grammar config).
  */
-async function* walkDir(dir: string, rootDir: string, maxDepth: number = 20): AsyncGenerator<string> {
+async function* walkDir(dir: string, rootDir: string, maxDepth: number = 20, extraExtensions?: Set<string>): AsyncGenerator<string> {
   if (maxDepth <= 0) return;
 
   let entries;
   try {
     entries = await readdir(dir, { withFileTypes: true });
-  } catch {
+  } catch (error) {
+    logger.debug('WORKER', `walkDir: failed to read directory ${dir}`, undefined, error instanceof Error ? error : undefined);
     return; // permission denied, etc.
   }
 
@@ -77,10 +91,10 @@ async function* walkDir(dir: string, rootDir: string, maxDepth: number = 20): As
     const fullPath = join(dir, entry.name);
 
     if (entry.isDirectory()) {
-      yield* walkDir(fullPath, rootDir, maxDepth - 1);
+      yield* walkDir(fullPath, rootDir, maxDepth - 1, extraExtensions);
     } else if (entry.isFile()) {
       const ext = entry.name.slice(entry.name.lastIndexOf("."));
-      if (CODE_EXTENSIONS.has(ext)) {
+      if (CODE_EXTENSIONS.has(ext) || (extraExtensions && extraExtensions.has(ext))) {
         yield fullPath;
       }
     }
@@ -102,7 +116,8 @@ async function safeReadFile(filePath: string): Promise<string | null> {
     if (content.slice(0, 1000).includes("\0")) return null;
 
     return content;
-  } catch {
+  } catch (error) {
+    logger.debug('WORKER', `safeReadFile: failed to read ${filePath}`, undefined, error instanceof Error ? error : undefined);
     return null;
   }
 }
@@ -121,16 +136,29 @@ export async function searchCodebase(
     maxResults?: number;
     includeImports?: boolean;
     filePattern?: string;
+    projectRoot?: string;
   } = {}
 ): Promise<SearchResult> {
   const maxResults = options.maxResults || 20;
   const queryLower = query.toLowerCase();
   const queryParts = queryLower.split(/[\s_\-./]+/).filter(p => p.length > 0);
 
+  // Load user grammar config for extra file extensions
+  const projectRoot = options.projectRoot || rootDir;
+  const userConfig = loadUserGrammars(projectRoot);
+  const extraExtensions = new Set<string>();
+  for (const entry of Object.values(userConfig.grammars)) {
+    for (const ext of entry.extensions) {
+      if (!CODE_EXTENSIONS.has(ext)) {
+        extraExtensions.add(ext);
+      }
+    }
+  }
+
   // Phase 1: Collect files
   const filesToParse: Array<{ absolutePath: string; relativePath: string; content: string }> = [];
 
-  for await (const filePath of walkDir(rootDir, rootDir)) {
+  for await (const filePath of walkDir(rootDir, rootDir, 20, extraExtensions.size > 0 ? extraExtensions : undefined)) {
     if (options.filePattern) {
       const relPath = relative(rootDir, filePath);
       if (!relPath.toLowerCase().includes(options.filePattern.toLowerCase())) continue;
@@ -147,7 +175,7 @@ export async function searchCodebase(
   }
 
   // Phase 2: Batch parse (one CLI call per language)
-  const parsedFiles = parseFilesBatch(filesToParse);
+  const parsedFiles = parseFilesBatch(filesToParse, projectRoot);
 
   // Phase 3: Match query against symbols
   const foldedFiles: FoldedFile[] = [];

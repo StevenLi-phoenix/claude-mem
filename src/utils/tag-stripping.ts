@@ -8,72 +8,134 @@
  *    (allows users to mark content they don't want persisted)
  * 3. <system_instruction> / <system-instruction> - Conductor-injected system instructions
  *    (should not be persisted to memory)
+ * 4. <system-reminder> - Claude Code-injected system reminders
+ *    (CLAUDE.md contents, deferred tool lists, etc. — should not be persisted)
+ * 5. <persisted-output> - Persisted-output payload tag
  *
  * EDGE PROCESSING PATTERN: Filter at hook layer before sending to worker/storage.
  * This keeps the worker service simple and follows one-way data stream.
+ *
+ * PATHFINDER plan 03 phase 8: collapsed countTags + stripTagsInternal into a
+ * single alternation regex. One pass over the input. One helper, N callers
+ * (`stripMemoryTagsFromJson` / `stripMemoryTagsFromPrompt` are thin adapters).
  */
 
 import { logger } from './logger.js';
 
+/** All tag names this module strips. Single source of truth for the regex. */
+const TAG_NAMES = [
+  'private',
+  'claude-mem-context',
+  'system_instruction',
+  'system-instruction',
+  'persisted-output',
+  'system-reminder',
+] as const;
+type TagName = (typeof TAG_NAMES)[number];
+
 /**
- * Maximum number of tags allowed in a single content block
- * This protects against ReDoS (Regular Expression Denial of Service) attacks
- * where malicious input with many nested/unclosed tags could cause catastrophic backtracking
+ * Single-pass alternation regex covering every privacy / context tag.
+ * Backreference `\1` ensures a closing tag matches the opening name; tag
+ * attributes (e.g. `<system-reminder data-foo="…">`) are tolerated via
+ * `[^>]*`.
  */
+const STRIP_REGEX = new RegExp(
+  `<(${TAG_NAMES.join('|')})\\b[^>]*>[\\s\\S]*?</\\1>`,
+  'g'
+);
+
+/**
+ * Regex to match <system-reminder> tags and their content.
+ * Exported for use by transcript parsers that strip system-reminder at read-time.
+ *
+ * Kept as a separate single-tag regex because the active transcript parser
+ * (`src/shared/transcript-parser.ts`) consumes only this one tag and would
+ * otherwise need to re-import the multi-tag list.
+ */
+export const SYSTEM_REMINDER_REGEX = /<system-reminder>[\s\S]*?<\/system-reminder>/g;
+
+/** Maximum total stripped-tag count before we log a ReDoS-class anomaly. */
 const MAX_TAG_COUNT = 100;
 
 /**
- * Count total number of opening tags in content
- * Used for ReDoS protection before regex processing
+ * Strip every recognised tag from `input` in a single pass.
+ *
+ * @returns the stripped string (trimmed) and per-tag counts. Counts are
+ *          surfaced to logs for observability but are not used as a control
+ *          signal.
  */
-function countTags(content: string): number {
-  const privateCount = (content.match(/<private>/g) || []).length;
-  const contextCount = (content.match(/<claude-mem-context>/g) || []).length;
-  const systemInstructionCount = (content.match(/<system_instruction>/g) || []).length;
-  const systemInstructionHyphenCount = (content.match(/<system-instruction>/g) || []).length;
-  return privateCount + contextCount + systemInstructionCount + systemInstructionHyphenCount;
-}
+export function stripTags(input: string): { stripped: string; counts: Record<TagName, number> } {
+  const counts: Record<TagName, number> = Object.fromEntries(
+    TAG_NAMES.map(name => [name, 0])
+  ) as Record<TagName, number>;
 
-/**
- * Internal function to strip memory tags from content
- * Shared logic extracted from both JSON and prompt stripping functions
- */
-function stripTagsInternal(content: string): string {
-  // ReDoS protection: limit tag count before regex processing
-  const tagCount = countTags(content);
-  if (tagCount > MAX_TAG_COUNT) {
+  STRIP_REGEX.lastIndex = 0; // /g state is per-instance — reset before each call.
+
+  let total = 0;
+  const stripped = input.replace(STRIP_REGEX, (_, name: TagName) => {
+    counts[name] = (counts[name] ?? 0) + 1;
+    total += 1;
+    return '';
+  });
+
+  if (total > MAX_TAG_COUNT) {
     logger.warn('SYSTEM', 'tag count exceeds limit', undefined, {
-      tagCount,
+      tagCount: total,
       maxAllowed: MAX_TAG_COUNT,
-      contentLength: content.length
+      contentLength: input.length,
     });
-    // Still process but log the anomaly
   }
 
-  return content
-    .replace(/<claude-mem-context>[\s\S]*?<\/claude-mem-context>/g, '')
-    .replace(/<private>[\s\S]*?<\/private>/g, '')
-    .replace(/<system_instruction>[\s\S]*?<\/system_instruction>/g, '')
-    .replace(/<system-instruction>[\s\S]*?<\/system-instruction>/g, '')
-    .trim();
+  return { stripped: stripped.trim(), counts };
 }
 
 /**
- * Strip memory tags from JSON-serialized content (tool inputs/responses)
- *
- * @param content - Stringified JSON content from tool_input or tool_response
- * @returns Cleaned content with tags removed, or '{}' if invalid
+ * Strip memory tags from JSON-serialized content (tool inputs/responses).
+ * Thin adapter around `stripTags` — same regex, same single pass.
  */
 export function stripMemoryTagsFromJson(content: string): string {
-  return stripTagsInternal(content);
+  return stripTags(content).stripped;
 }
 
 /**
- * Strip memory tags from user prompt content
- *
- * @param content - Raw user prompt text
- * @returns Cleaned content with tags removed
+ * Strip memory tags from user prompt content.
+ * Thin adapter around `stripTags` — same regex, same single pass.
  */
 export function stripMemoryTagsFromPrompt(content: string): string {
-  return stripTagsInternal(content);
+  return stripTags(content).stripped;
+}
+
+/**
+ * Tag names that Claude Code emits autonomously into the prompt stream as
+ * protocol notifications — never authored by the user. When the entire prompt
+ * payload is one of these blocks (with no surrounding user text), the hook
+ * MUST skip storage to keep `user_prompts` clean.
+ *
+ * Conservative deny-list: do NOT add `<command-name>` / `<command-message>`
+ * here — those wrap genuine user slash-command invocations.
+ */
+const PROTOCOL_ONLY_TAGS = ['task-notification'] as const;
+
+// Negative lookahead in the body keeps a payload like
+// "<task-notification>x</task-notification> hi <task-notification>y</task-notification>"
+// from matching as a single outer block (greedy [\s\S]* would otherwise span
+// the middle user text and silently drop a real prompt).
+const PROTOCOL_ONLY_REGEX = new RegExp(
+  `^\\s*<(${PROTOCOL_ONLY_TAGS.join('|')})\\b[^>]*>(?:(?!<\\1\\b|</\\1\\b)[\\s\\S])*</\\1>\\s*$`,
+);
+
+// Bounds the unanchored `[\s\S]*` body to keep a malformed 1MB+ payload that
+// opens a protocol tag and never closes it from running the regex engine
+// against the whole prompt before failing.
+const MAX_PROTOCOL_PAYLOAD_BYTES = 256 * 1024;
+
+/**
+ * Returns true when `text` is *entirely* a Claude Code protocol payload
+ * (e.g. a `<task-notification>` block emitted on background Agent completion)
+ * with no surrounding user-authored content.
+ */
+export function isInternalProtocolPayload(text: string): boolean {
+  if (!text) return false;
+  if (text.length > MAX_PROTOCOL_PAYLOAD_BYTES) return false;
+  return PROTOCOL_ONLY_REGEX.test(text);
 }

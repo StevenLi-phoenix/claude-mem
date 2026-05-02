@@ -37,6 +37,26 @@ npm run build-and-sync        # Build, sync to marketplace, restart worker
 
 Settings are managed in `~/.claude-mem/settings.json`. The file is auto-created with defaults on first run.
 
+## Multi-account
+
+Claude-mem supports running multiple isolated profiles on the same machine (e.g. work vs personal accounts) via environment variables. No CLI subcommand needed — set the env vars in the shell where you run Claude Code.
+
+- **Switch profiles per shell:** Set `CLAUDE_MEM_DATA_DIR=<path>` and every claude-mem path (database, chroma, logs, settings.json, worker.pid, transcripts config) derives from it. Example:
+
+  ```bash
+  export CLAUDE_MEM_DATA_DIR="$HOME/.claude-mem-work"
+  ```
+
+- **Port collisions are auto-handled:** The default worker port is `37700 + (uid % 100)`, so two different OS users on the same box get different ports for free. If you want fixed ports per profile (e.g. you run two profiles as the same UID), set `CLAUDE_MEM_WORKER_PORT` too:
+
+  ```bash
+  export CLAUDE_MEM_WORKER_PORT=37800
+  ```
+
+- **All paths and ports derive from these two env vars.** Hooks, npx-cli (`install`/`uninstall`/`start`/`search`), the OpenCode plugin, the OpenClaw installer, and the timeline-report skill all honor them. The settings file itself lives at `$CLAUDE_MEM_DATA_DIR/settings.json`.
+
+- **Closes #2101.** See `src/shared/SettingsDefaultsManager.ts` for the canonical port/data-dir defaults and `plugin/skills/timeline-report/SKILL.md` for the shell snippet that resolves the port for arbitrary skills.
+
 ## File Locations
 
 - **Source**: `<project-root>/src/`
@@ -92,3 +112,13 @@ This architecture preserves the open-source nature of the project while enabling
 ## Important
 
 No need to edit the changelog ever, it's generated automatically.
+
+## Daily Maintenance
+
+Run a daily version check across all package manifests and upgrade every dependency to its latest version — including major version bumps. Staying on the latest is the goal; do not skip majors.
+
+- Check `package.json` (root) and all nested `package.json` files (e.g. `plugin/`, `openclaw/`) for outdated dependencies via `npm outdated`.
+- Upgrade every package to `latest` (use `npm install <pkg>@latest` for each, or `npx npm-check-updates -u && npm install`). Bump majors too.
+- Run `npm audit fix` to resolve advisories.
+- After upgrades, run `npm run build-and-sync` and verify the worker starts and tests pass. Fix any breakage caused by major bumps in the same change.
+- Commit the updated `package.json` and `package-lock.json` files.
