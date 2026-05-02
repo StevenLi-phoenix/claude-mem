@@ -34,12 +34,12 @@ jobs:
             exit 0
           fi
 
-          if git merge upstream/main --no-edit; then
-            # Restore our workflow files: GITHUB_TOKEN cannot push workflow file changes
-            git checkout HEAD@{1} -- .github/workflows/
-            if ! git diff --cached --quiet; then
-              git commit --amend --no-edit
-            fi
+          # --no-commit lets us strip workflow file changes before the push
+          if git merge upstream/main --no-commit; then
+            # GITHUB_TOKEN cannot push .github/workflows/ changes — restore ours
+            git rm -r --cached --ignore-unmatch .github/workflows/
+            git checkout HEAD -- .github/workflows/ 2>/dev/null || true
+            git commit -m "Merge remote-tracking branch 'upstream/main'"
             git push origin main
             echo "Merged upstream/main successfully"
             echo "status=merged" >> "$GITHUB_OUTPUT"
@@ -62,8 +62,8 @@ jobs:
           git config user.name "claudecode[bot]"
           git config user.email "noreply@anthropic.com"
 
-          # Start merge (will have conflicts)
-          git merge upstream/main --no-edit || true
+          # Start merge without auto-commit
+          git merge upstream/main --no-commit || true
 
           # Use Claude Code to resolve conflicts
           claude -p "
@@ -82,10 +82,11 @@ jobs:
             exit 1
           fi
 
-          # Restore our workflow files: GITHUB_TOKEN cannot push workflow file changes
-          git checkout HEAD@{1} -- .github/workflows/
+          # GITHUB_TOKEN cannot push .github/workflows/ changes — restore ours
+          git rm -r --cached --ignore-unmatch .github/workflows/
+          git checkout HEAD -- .github/workflows/ 2>/dev/null || true
 
           # Commit and push
-          git commit --no-edit
+          git commit -m "Merge remote-tracking branch 'upstream/main'"
           git push origin main
           echo "Conflicts resolved and pushed"
