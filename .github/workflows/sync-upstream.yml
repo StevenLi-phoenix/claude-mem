@@ -37,6 +37,13 @@ jobs:
           fi
 
           if git merge upstream/main --no-edit; then
+            # Restore our own workflow files so GITHUB_TOKEN can push
+            git checkout HEAD@{1} -- .github/workflows/ 2>/dev/null || true
+            if git diff --cached --quiet; then
+              echo "No net changes after restoring workflows"
+            else
+              git commit --amend --no-edit
+            fi
             git push origin main
             echo "Merged upstream/main successfully"
             echo "status=merged" >> "$GITHUB_OUTPUT"
@@ -78,6 +85,9 @@ jobs:
             echo "::error::Conflict markers still present"
             exit 1
           fi
+
+          # Restore our own workflow files so GITHUB_TOKEN can push
+          git checkout HEAD@{1} -- .github/workflows/ 2>/dev/null || true
 
           # Commit and push
           git commit --no-edit
