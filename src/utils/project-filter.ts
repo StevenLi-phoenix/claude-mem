@@ -1,20 +1,9 @@
-/**
- * Project Filter Utility
- *
- * Provides glob-based path matching for project exclusion.
- * Supports: ~ (home), * (any chars except /), ** (any path), ? (single char)
- */
 
 import { homedir } from 'os';
 import { existsSync, realpathSync } from 'fs';
 import { basename, join } from 'path';
 
-/**
- * Convert a glob pattern to a regular expression
- * Supports: ~ (home dir), * (any non-slash), ** (any path), ? (single char)
- */
 function globToRegex(pattern: string): RegExp {
-  // Expand ~ to home directory
   let expanded = pattern.startsWith('~')
     ? homedir() + pattern.slice(1)
     : pattern;
@@ -27,29 +16,17 @@ function globToRegex(pattern: string): RegExp {
   // Normalize path separators to forward slashes
   expanded = expanded.replace(/\\/g, '/');
 
-  // Escape regex special characters except * and ?
   let regex = expanded.replace(/[.+^${}()|[\]\\]/g, '\\$&');
 
-  // Convert glob patterns to regex:
-  // ** matches any path (including /)
-  // * matches any characters except /
-  // ? matches single character except /
   regex = regex
-    .replace(/\*\*/g, '<<<GLOBSTAR>>>')  // Temporary placeholder
-    .replace(/\*/g, '[^/]*')              // * = any non-slash
-    .replace(/\?/g, '[^/]')               // ? = single non-slash
-    .replace(/<<<GLOBSTAR>>>/g, '.*');    // ** = anything
+    .replace(/\*\*/g, '<<<GLOBSTAR>>>')  
+    .replace(/\*/g, '[^/]*')              
+    .replace(/\?/g, '[^/]')               
+    .replace(/<<<GLOBSTAR>>>/g, '.*');    
 
   return new RegExp(`^${regex}$`);
 }
 
-/**
- * Check if a path matches any of the exclusion patterns
- *
- * @param projectPath - Current working directory (absolute path)
- * @param exclusionPatterns - Comma-separated glob patterns (e.g., "~/kunden/*,/tmp/*")
- * @returns true if path should be excluded
- */
 export function isProjectExcluded(projectPath: string, exclusionPatterns: string): boolean {
   if (!exclusionPatterns || !exclusionPatterns.trim()) {
     return false;
@@ -65,7 +42,6 @@ export function isProjectExcluded(projectPath: string, exclusionPatterns: string
   // both bare names and basename globs silently fail (#2126 item 1).
   const projectBasename = basename(normalizedProjectPath);
 
-  // Parse comma-separated patterns
   const patternList = exclusionPatterns
     .split(',')
     .map(p => p.trim())
@@ -90,7 +66,6 @@ export function isProjectExcluded(projectPath: string, exclusionPatterns: string
         }
       }
     } catch (error: unknown) {
-      // Invalid pattern, skip it
       console.warn(`[project-filter] Invalid exclusion pattern "${pattern}":`, error instanceof Error ? error.message : String(error));
       continue;
     }
