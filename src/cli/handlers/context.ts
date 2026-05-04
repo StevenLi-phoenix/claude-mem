@@ -10,6 +10,7 @@ import { HOOK_EXIT_CODES } from '../../shared/hook-constants.js';
 import { logger } from '../../utils/logger.js';
 import { isProjectExcluded, isProjectLocallyDisabled } from '../../utils/project-filter.js';
 import { loadFromFileOnce } from '../../shared/hook-settings.js';
+import { readStaleMarker } from '../../shared/oauth-token.js';
 
 export const contextHandler: EventHandler = {
   async execute(input: NormalizedHookInput): Promise<HookResult> {
@@ -62,6 +63,17 @@ export const contextHandler: EventHandler = {
     } else {
       logger.warn('HOOK', 'Context response was not a string', { type: typeof contextResult });
       return emptyResult;
+    }
+
+    // Issue #2215: surface stale OAuth token marker as a session-start hint.
+    // Marker is written by EnvManager.buildIsolatedEnvWithFreshOAuth() when
+    // a previous worker spawn detected an expired keychain entry.
+    const staleReason = readStaleMarker();
+    if (staleReason) {
+      const hint = `[claude-mem] Claude Desktop OAuth token is stale: ${staleReason}\nPlease re-login via Claude Desktop to refresh the token.`;
+      additionalContext = additionalContext
+        ? `${hint}\n\n${additionalContext}`
+        : hint;
     }
 
     let coloredTimeline = '';
