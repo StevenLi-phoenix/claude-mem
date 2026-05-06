@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [12.7.1] - 2026-05-06
+
+## Added
+- Package the new `babysit` skill for monitoring PR checks, review comments, and unresolved review threads until a PR is merge-ready.
+
+## Verification
+- `npm run build`
+- `npm publish` completed for `claude-mem@12.7.1`
+
+## [12.7.0] - 2026-05-06
+
+## Added
+- Add native Codex hooks integration through the Codex plugin marketplace.
+- Add Codex hook payload normalization, file-context extraction, and Stop hook observation support.
+- Add Codex installer support for `npx claude-mem@latest install` with Codex CLI version guidance.
+
+## Fixed
+- Avoid slow observation flow retries by replacing the worker-side initialization wait with hook-side readiness polling.
+- Keep Codex file-context extraction from consuming boolean flags like `cat -n`.
+- Include `bun-runner.js` in hook distribution verification.
+
+## [12.6.4] - 2026-05-05
+
+## Fixed
+- Drain invalid/non-XML observer responses so pending agent observations are cleared instead of retrying forever (PR #2316 / issue #2315).
+- Correct all plugin manifest versions so Claude, Codex, OpenClaw, bundled plugin, and npm metadata agree on 12.6.4.
+
+## [12.6.5] - 2026-05-05
+
+### Added
+- Installer now keeps the Claude Agent SDK as the single memory-agent path while supporting subscription auth, direct Anthropic API keys, and LiteLLM/custom gateway setup.
+- Added gateway env support for `ANTHROPIC_AUTH_TOKEN` alongside `ANTHROPIC_BASE_URL`.
+
+### Fixed
+- Removed the fixed agent-pool slot timeout so queued memory-agent work waits for process availability instead of dropping pending messages under load.
+- Reset generator failures back to pending messages instead of clearing queued work.
+
 ## [12.6.2] - 2026-05-05
 
 ## Fix: `npx claude-mem@latest install` no longer hangs on tree-sitter-swift
