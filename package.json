@@ -1,6 +1,6 @@
 {
   "name": "claude-mem",
-  "version": "12.7.1",
+  "version": "12.7.5",
   "description": "Memory compression system for Claude Code - persist context across sessions",
   "keywords": [
     "claude",
@@ -82,6 +82,7 @@
     "queue": "bun scripts/check-pending-queue.ts",
     "queue:process": "bun scripts/check-pending-queue.ts --process",
     "queue:clear": "bun scripts/clear-failed-queue.ts --all --force",
+    "pr:status": "bun scripts/pr-babysit-status.ts",
     "claude-md:regenerate": "bun scripts/regenerate-claude-md.ts",
     "claude-md:dry-run": "bun scripts/regenerate-claude-md.ts --dry-run",
     "strip-comments": "bun scripts/strip-comments.ts",
