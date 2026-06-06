@@ -553,12 +553,12 @@ export async function ensureWorkerStarted(port: number): Promise<WorkerStartResu
   return ensureWorkerStartedShared(port, __filename);
 }
 
-type ParsedWorkerCommand = {
+export type ParsedWorkerCommand = {
   command: string | undefined;
   args: string[];
 };
 
-function parseWorkerServiceCommand(argv: string[]): ParsedWorkerCommand {
+export function parseWorkerServiceCommand(argv: string[]): ParsedWorkerCommand {
   const [rawCommand, maybeSubCommand, ...rest] = argv;
 
   if (rawCommand === 'server') {
@@ -951,6 +951,18 @@ async function main() {
       writeFileSync(settingsPath, JSON.stringify(settingsData, null, 2), 'utf-8');
       console.log(`claude-mem enabled for: ${repoPath}`);
       process.exit(0);
+      break;
+    }
+
+    case 'transcript': {
+      // npx-cli falls back to `worker-service.cjs transcript <sub>` when the
+      // standalone `transcript-watcher.cjs` is not present in the bundle
+      // (see thedotmack/claude-mem 2450). Dispatch to the shared
+      // implementation so `init`, `watch`, and `validate` all work
+      // regardless of which entry point the user invokes.
+      const { runTranscriptCommand } = await import('./transcripts/cli.js');
+      const exitCode = await runTranscriptCommand(commandArgs[0], commandArgs.slice(1));
+      process.exit(exitCode);
       break;
     }
 
