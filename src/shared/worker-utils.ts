@@ -4,11 +4,12 @@ import { execSync } from "child_process";
 import { spawnHidden } from "./spawn.js";
 import { logger } from "../utils/logger.js";
 import { HOOK_TIMEOUTS, getTimeout } from "./hook-constants.js";
-import { SettingsDefaultsManager } from "./SettingsDefaultsManager.js";
+import { SettingsDefaultsManager, type SettingsDefaults } from "./SettingsDefaultsManager.js";
 import { MARKETPLACE_ROOT, DATA_DIR } from "./paths.js";
 import { loadFromFileOnce } from "./hook-settings.js";
 import { validateWorkerPidFile } from "../supervisor/index.js";
 import { emitBlockingError } from "./hook-io.js";
+import { captureCliEvent } from "../services/telemetry/cli-telemetry.js";
 import { checkVersionMatch } from "../services/infrastructure/index.js";
 
 function readTimeoutEnv(
@@ -47,6 +48,8 @@ const HOOK_READINESS_TIMEOUT_MS = readTimeoutEnv(
   { min: 0, max: 300000 }
 );
 
+const API_REQUEST_TIMEOUT_BOUNDS = { min: 500, max: 300000 } as const;
+
 export function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs: number): Promise<Response> {
   return new Promise((resolve, reject) => {
     const timeoutId = setTimeout(
@@ -62,14 +65,69 @@ export function fetchWithTimeout(url: string, init: RequestInit = {}, timeoutMs:
 
 let cachedPort: number | null = null;
 let cachedHost: string | null = null;
+let cachedSettings: SettingsDefaults | null = null;
+let cachedApiRequestTimeoutMs: number | null = null;
+
+function getWorkerSettingsPath(): string {
+  return path.join(SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'), 'settings.json');
+}
+
+function getWorkerSettings(): SettingsDefaults {
+  if (cachedSettings !== null) {
+    return cachedSettings;
+  }
+
+  cachedSettings = SettingsDefaultsManager.loadFromFile(getWorkerSettingsPath());
+  return cachedSettings;
+}
+
+function parseBoundedTimeout(
+  rawValue: string | undefined,
+  bounds: { min: number; max: number }
+): number | null {
+  if (!rawValue) return null;
+  const parsed = parseInt(rawValue, 10);
+  if (Number.isFinite(parsed) && parsed >= bounds.min && parsed <= bounds.max) {
+    return parsed;
+  }
+  return null;
+}
+
+function readSettingsBackedTimeout(
+  settingName: keyof SettingsDefaults,
+  defaultValue: number,
+  bounds: { min: number; max: number }
+): number {
+  const envVal = process.env[settingName];
+  if (envVal !== undefined) {
+    const parsed = parseBoundedTimeout(envVal, bounds);
+    if (parsed !== null) {
+      return parsed;
+    }
+    logger.warn('SYSTEM', `Invalid ${settingName}, using default`, {
+      value: envVal, min: bounds.min, max: bounds.max
+    });
+    return defaultValue;
+  }
+
+  const settingsValue = getWorkerSettings()[settingName];
+  const parsed = parseBoundedTimeout(settingsValue, bounds);
+  if (parsed !== null) {
+    return parsed;
+  }
+
+  logger.warn('SYSTEM', `Invalid ${settingName} in settings.json, using default`, {
+    value: settingsValue, min: bounds.min, max: bounds.max
+  });
+  return defaultValue;
+}
 
 export function getWorkerPort(): number {
   if (cachedPort !== null) {
     return cachedPort;
   }
 
-  const settingsPath = path.join(SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'), 'settings.json');
-  const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
+  const settings = getWorkerSettings();
   cachedPort = parseInt(settings.CLAUDE_MEM_WORKER_PORT, 10);
   return cachedPort;
 }
@@ -79,15 +137,29 @@ export function getWorkerHost(): string {
     return cachedHost;
   }
 
-  const settingsPath = path.join(SettingsDefaultsManager.get('CLAUDE_MEM_DATA_DIR'), 'settings.json');
-  const settings = SettingsDefaultsManager.loadFromFile(settingsPath);
+  const settings = getWorkerSettings();
   cachedHost = settings.CLAUDE_MEM_WORKER_HOST;
   return cachedHost;
+}
+
+export function getWorkerApiRequestTimeoutMs(): number {
+  if (cachedApiRequestTimeoutMs !== null) {
+    return cachedApiRequestTimeoutMs;
+  }
+
+  cachedApiRequestTimeoutMs = readSettingsBackedTimeout(
+    'CLAUDE_MEM_API_TIMEOUT_MS',
+    getTimeout(HOOK_TIMEOUTS.API_REQUEST),
+    API_REQUEST_TIMEOUT_BOUNDS
+  );
+  return cachedApiRequestTimeoutMs;
 }
 
 export function clearPortCache(): void {
   cachedPort = null;
   cachedHost = null;
+  cachedSettings = null;
+  cachedApiRequestTimeoutMs = null;
 }
 
 export function buildWorkerUrl(apiPath: string): string {
@@ -104,7 +176,7 @@ export function workerHttpRequest(
   } = {}
 ): Promise<Response> {
   const method = options.method ?? 'GET';
-  const timeoutMs = options.timeoutMs ?? API_REQUEST_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? getWorkerApiRequestTimeoutMs();
 
   const url = buildWorkerUrl(apiPath);
   const init: RequestInit = { method };
@@ -377,7 +449,35 @@ function getFailLoudThreshold(): number {
   return FAIL_LOUD_DEFAULT_THRESHOLD;
 }
 
-function recordWorkerUnreachable(): number {
+/**
+ * Closed enum of hook handler names allowed as the `hook_type` telemetry
+ * property. Mirrors the scrub whitelist comment (scrub.ts), the CLI
+ * disclosure (npx-cli/commands/telemetry.ts), and docs/public/telemetry.mdx —
+ * never widen one without the others. Events outside this set (user-message,
+ * file-edit) simply omit hook_type.
+ */
+const TELEMETRY_HOOK_TYPES = ['context', 'session-init', 'observation', 'summarize', 'file-context'] as const;
+export type TelemetryHookType = (typeof TELEMETRY_HOOK_TYPES)[number];
+
+let activeHookType: TelemetryHookType | null = null;
+
+/**
+ * Record which hook event this short-lived hook process is executing, so the
+ * fail-loud counter can tag its threshold-gated hook_failed telemetry.
+ * Called once at hookCommand entry; values outside the closed enum are
+ * dropped (never free text).
+ */
+export function setActiveHookType(event: string): void {
+  activeHookType = (TELEMETRY_HOOK_TYPES as readonly string[]).includes(event)
+    ? (event as TelemetryHookType)
+    : null;
+}
+
+export function getActiveHookType(): TelemetryHookType | null {
+  return activeHookType;
+}
+
+export async function recordWorkerUnreachable(): Promise<number> {
   const state = readHookFailureState();
   const next: HookFailureState = {
     consecutiveFailures: state.consecutiveFailures + 1,
@@ -387,6 +487,23 @@ function recordWorkerUnreachable(): number {
 
   const threshold = getFailLoudThreshold();
   if (next.consecutiveFailures >= threshold) {
+    // hook_failed distress signal. Gated to the failure that JUST reached the
+    // threshold (`===`, not `>=`): the stderr warning below repeats on every
+    // failure past the threshold, but telemetry emits once per failure streak
+    // to bound volume. MUST be awaited BEFORE emitBlockingError — it calls
+    // process.exit(2) immediately, which would kill a fire-and-forget POST
+    // mid-flight. captureCliEvent never throws and is hard-capped at 2s, so
+    // this cannot hang the fail-loud path. Closed-enum/count props only —
+    // never error text. Transport is the direct CLI POST, never the worker
+    // API (the defining failure here IS "worker unreachable").
+    if (next.consecutiveFailures === threshold) {
+      await captureCliEvent('hook_failed', {
+        ...(activeHookType !== null ? { hook_type: activeHookType } : {}),
+        error_mode: 'worker_unavailable',
+        consecutive_failures: next.consecutiveFailures,
+        threshold_tripped: true,
+      });
+    }
     // #2292 fix: BLOCKING_FEEDBACK. emitBlockingError flushes the Phase 2
     // stderr buffer (so preceding logger.warn lines also surface) and writes
     // via the bypass channel + exits 2. Previously this raw process.stderr.write
@@ -430,7 +547,7 @@ export async function executeWithWorkerFallback<T = unknown>(
 ): Promise<WorkerCallResult<T>> {
   const alive = await ensureWorkerAliveOnce();
   if (!alive) {
-    recordWorkerUnreachable();
+    await recordWorkerUnreachable();
     return { continue: true, reason: 'worker_unreachable', [WORKER_FALLBACK_BRAND]: true };
   }
 
