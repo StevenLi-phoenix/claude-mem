@@ -40,7 +40,6 @@ import {
   readPidFile,
   removePidFileIfOwner,
   getPlatformTimeout,
-  runOneTimeChromaMigration,
   runOneTimeCwdRemap,
   cleanStalePidFile,
   verifyPidFileOwnership,
@@ -70,7 +69,6 @@ import {
 import { ServerV1Routes } from '../server/routes/v1/ServerV1Routes.js';
 
 import {
-  updateCursorContextForProject,
   handleCursorCommand
 } from './integrations/CursorHooksInstaller.js';
 import {
@@ -154,6 +152,7 @@ function writeCleanShutdownSentinel(): void {
     ensureDir(DATA_DIR);
     writeFileSync(CLEAN_SHUTDOWN_SENTINEL_PATH, new Date().toISOString());
   } catch (error: unknown) {
+    // [ANTI-PATTERN IGNORED]: sentinel is best-effort crash-detection metadata; a failed write must not abort graceful shutdown. Logged at warn with path; worst case the next boot reports 'crash' instead of 'clean'.
     if (error instanceof Error) {
       logger.warn('SYSTEM', 'Failed to write clean-shutdown sentinel', { path: CLEAN_SHUTDOWN_SENTINEL_PATH }, error);
     } else {
@@ -169,6 +168,7 @@ function readAndClearCleanShutdownSentinel(): string | null {
   try {
     contents = readFileSync(CLEAN_SHUTDOWN_SENTINEL_PATH, 'utf-8').trim();
   } catch (error: unknown) {
+    // [ANTI-PATTERN IGNORED]: sentinel read is best-effort crash-detection metadata; startup must proceed even if the sentinel is unreadable. Logged at warn with path; falls through to the delete, and the caller sees contents=null.
     if (error instanceof Error) {
       logger.warn('SYSTEM', 'Failed to read clean-shutdown sentinel', { path: CLEAN_SHUTDOWN_SENTINEL_PATH }, error);
     } else {
@@ -180,6 +180,7 @@ function readAndClearCleanShutdownSentinel(): string | null {
     // crash as 'clean'.
     unlinkSync(CLEAN_SHUTDOWN_SENTINEL_PATH);
   } catch (error: unknown) {
+    // [ANTI-PATTERN IGNORED]: sentinel delete is best-effort; startup must proceed even if the unlink fails. Logged at warn with path; worst case a stale sentinel mislabels one later crash as 'clean'.
     if (error instanceof Error) {
       logger.warn('SYSTEM', 'Failed to remove clean-shutdown sentinel', { path: CLEAN_SHUTDOWN_SENTINEL_PATH }, error);
     } else {
@@ -467,11 +468,6 @@ export class WorkerService implements WorkerRef {
         logger.info('SYSTEM', 'Dependency preflight passed');
       }
 
-      if (settings.CLAUDE_MEM_MODE === 'local' || !settings.CLAUDE_MEM_MODE) {
-        logger.info('WORKER', 'Checking for one-time Chroma migration...');
-        runOneTimeChromaMigration();
-      }
-
       logger.info('WORKER', 'Checking for one-time CWD remap...');
       runOneTimeCwdRemap();
 
@@ -521,15 +517,9 @@ export class WorkerService implements WorkerRef {
       this.server.registerRoutes(this.searchRoutes);
       logger.info('WORKER', 'SearchManager initialized and search routes registered');
 
-      const { SearchOrchestrator } = await import('./worker/search/SearchOrchestrator.js');
-      const corpusSearchOrchestrator = new SearchOrchestrator(
-        this.dbManager.getSessionSearch(),
-        this.dbManager.getSessionStore(),
-        this.dbManager.getChromaSync()
-      );
       const corpusBuilder = new CorpusBuilder(
         this.dbManager.getSessionStore(),
-        corpusSearchOrchestrator,
+        searchManager.getOrchestrator(),
         this.corpusStore
       );
       const knowledgeAgent = new KnowledgeAgent(this.corpusStore);
@@ -559,15 +549,14 @@ export class WorkerService implements WorkerRef {
             .get() as { platform_source?: string } | null;
           if (row?.platform_source) props.ide = row.platform_source;
         } catch (error) {
-          // Expected only before the schema exists; anything else (e.g. the
-          // wrong-table query this once masked) should be diagnosable.
-          logger.debug('SYSTEM', 'ide lookup for lifecycle telemetry failed', {}, error as Error);
+          // [ANTI-PATTERN IGNORED]: telemetry enrichment is best-effort — the worker_started event must ship even without the ide property. Expected only before the schema exists; logged at debug so anything else (e.g. the wrong-table query this once masked) stays diagnosable.
+          logger.debug('SYSTEM', 'ide lookup for lifecycle telemetry failed', {}, error instanceof Error ? error : new Error(String(error)));
         }
         try {
           Object.assign(props, collectInstallStats(this.dbManager.getConnection()));
         } catch (error) {
-          // Snapshot is best-effort; the lifecycle event still ships without it.
-          logger.debug('SYSTEM', 'Install stats snapshot failed', {}, error as Error);
+          // [ANTI-PATTERN IGNORED]: install-stats snapshot is best-effort telemetry enrichment; the lifecycle event still ships without it. Logged at debug for diagnosability.
+          logger.debug('SYSTEM', 'Install stats snapshot failed', {}, error instanceof Error ? error : new Error(String(error)));
         }
         // Process health for the daily heartbeat: memoryUsage() returns bytes;
         // the scrubber drops non-finite numbers, so round to whole MiB.
@@ -623,34 +612,37 @@ export class WorkerService implements WorkerRef {
 
   private async runMcpSelfCheck(mcpServerPath: string): Promise<void> {
     try {
-      getSupervisor().assertCanSpawn('mcp server');
-      const transport = new StdioClientTransport({
-        command: process.execPath,
-        args: [mcpServerPath],
-        env: Object.fromEntries(
-          Object.entries(sanitizeEnv(process.env)).filter(([, value]) => value !== undefined)
-        ) as Record<string, string>
-      });
-
-      const MCP_INIT_TIMEOUT_MS = 60000;
-      const mcpConnectionPromise = this.mcpClient.connect(transport);
-
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(
-          () => reject(new Error('MCP connection timeout')),
-          MCP_INIT_TIMEOUT_MS
-        );
-      });
-
-      await Promise.race([mcpConnectionPromise, timeoutPromise]);
-      logger.info('WORKER', 'MCP loopback self-check connected successfully');
-
-      await transport.close();
+      await this.connectMcpLoopback(mcpServerPath);
     } catch (error) {
-      logger.warn('WORKER', 'MCP loopback self-check failed', { 
-        error: error instanceof Error ? error.message : String(error) 
-      });
+      // [ANTI-PATTERN IGNORED]: loopback self-check is diagnostic only — a failed probe must not kill a worker that is otherwise serving requests. Logged at warn with the full error.
+      logger.warn('WORKER', 'MCP loopback self-check failed', {}, error instanceof Error ? error : new Error(String(error)));
     }
+  }
+
+  private async connectMcpLoopback(mcpServerPath: string): Promise<void> {
+    getSupervisor().assertCanSpawn('mcp server');
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [mcpServerPath],
+      env: Object.fromEntries(
+        Object.entries(sanitizeEnv(process.env)).filter(([, value]) => value !== undefined)
+      ) as Record<string, string>
+    });
+
+    const MCP_INIT_TIMEOUT_MS = 60000;
+    const mcpConnectionPromise = this.mcpClient.connect(transport);
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(
+        () => reject(new Error('MCP connection timeout')),
+        MCP_INIT_TIMEOUT_MS
+      );
+    });
+
+    await Promise.race([mcpConnectionPromise, timeoutPromise]);
+    logger.info('WORKER', 'MCP loopback self-check connected successfully');
+
+    await transport.close();
   }
 
   private async startTranscriptWatcher(settings: ReturnType<typeof SettingsDefaultsManager.loadFromFile>): Promise<void> {
@@ -814,7 +806,7 @@ export function parseWorkerServiceCommand(argv: string[]): ParsedWorkerCommand {
     if (maybeSubCommand && lifecycleCommands.has(maybeSubCommand)) {
       return { command: `server-${maybeSubCommand}`, args: rest };
     }
-    const serverCommands = new Set(['logs', 'doctor', 'migrate', 'export', 'import', 'api-key', 'keys', 'jobs']);
+    const serverCommands = new Set(['api-key', 'keys', 'jobs']);
     return {
       command: maybeSubCommand && serverCommands.has(maybeSubCommand) ? `server-${maybeSubCommand}` : 'server-help',
       args: rest,
@@ -835,15 +827,9 @@ export function parseWorkerServiceCommand(argv: string[]): ParsedWorkerCommand {
   };
 }
 
-function printServerCommandUnsupported(command: string): never {
-  console.error(`Server command not implemented yet: ${command}`);
-  console.error('This worker bundle accepts the CLI route, but no backend API exists for it yet.');
-  process.exit(1);
-}
-
 function printServerCommandHelp(): never {
   console.error('Usage: worker-service server <command>');
-  console.error('Commands: start, stop, restart, status, logs, doctor, migrate, export, import, api-key create|list|revoke');
+  console.error('Commands: start, stop, restart, status, api-key create|list|revoke');
   process.exit(1);
 }
 
@@ -1200,15 +1186,6 @@ async function main() {
       break;
     }
 
-    case 'server-logs':
-    case 'server-doctor':
-    case 'server-migrate':
-    case 'server-export':
-    case 'server-import': {
-      printServerCommandUnsupported(command.replace('-', ' '));
-      break;
-    }
-
     case 'server-api-key': {
       const apiKeyCommand = commandArgs[0];
       if (apiKeyCommand === 'create' || apiKeyCommand === 'list' || apiKeyCommand === 'revoke') {
@@ -1506,6 +1483,7 @@ async function fetchWorkerHealth(port: number, timeoutMs: number): Promise<Worke
     const response = await fetchWithTimeout(`http://${getWorkerHost()}:${port}/api/health`, {}, timeoutMs);
     return await response.json() as WorkerHealthSnapshot;
   } catch {
+    // [ANTI-PATTERN IGNORED]: health probe — connection refused/timeout IS the "worker not running" answer, polled on every status check; logging would spam. null is the documented recovery value the callers branch on.
     return null;
   }
 }
